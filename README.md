@@ -1,73 +1,110 @@
-# Welcome to your Lovable project
+# StudyMate
 
-## Project info
+StudyMate is a React and Supabase MVP for uploading searchable study PDFs, extracting their text on the server, and asking document-grounded questions with page citations.
 
-**URL**: https://lovable.dev/projects/c122ce7a-d67d-425b-889b-5dbdb2a6d36a
+## Requirements
 
-## How can I edit this code?
+- Node.js 20 or newer
+- npm
+- Docker Desktop only if running Supabase locally
+- A Supabase project
+- A Gemini API key for the server-side chat function
 
-There are several ways of editing your application.
+## Browser environment variables
 
-**Use Lovable**
+Copy `.env.example` to `.env` and set the browser-safe values from **Supabase Dashboard -> Project Settings -> API**:
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/c122ce7a-d67d-425b-889b-5dbdb2a6d36a) and start prompting.
+```env
+VITE_SUPABASE_PROJECT_ID="your-project-ref"
+VITE_SUPABASE_URL="https://your-project-ref.supabase.co"
+VITE_SUPABASE_PUBLISHABLE_KEY="your-anon-or-publishable-key"
+```
 
-Changes made via Lovable will be committed automatically to this repo.
+Only use the browser-safe publishable/anonymous key. Never put a Supabase service-role key or an AI provider key in a `VITE_*` variable because Vite includes those values in the browser bundle.
 
-**Use your preferred IDE**
+## Database and private Storage setup
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+The version-controlled migrations create the private `documents` bucket, `documents`, `document_chunks`, and `messages` tables, relevant indexes, temporary prototype policies, and the server-only text-search function.
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
-
-Follow these steps:
+Link the Supabase CLI and apply both migrations:
 
 ```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
+npx supabase link --project-ref agxarewpwagkrceqfkte
+npx supabase db push
+```
 
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
+Alternatively, run these files in timestamp order using **Supabase Dashboard -> SQL Editor**:
 
-# Step 3: Install the necessary dependencies.
-npm i
+1. `supabase/migrations/20260726183000_create_documents.sql`
+2. `supabase/migrations/20260726213000_add_document_processing_and_chat.sql`
 
-# Step 4: Start the development server with auto-reloading and an instant preview.
+In **Supabase Dashboard -> Storage**, confirm the `documents` bucket exists and **Public bucket** is disabled. The first migration creates and configures it automatically when run as written.
+
+## Server-only AI secrets
+
+The chat Edge Function uses the Gemini Interactions API. `gemini-3-flash-preview` is the default because it supports structured output and currently has a Gemini API free tier. Set secrets in Supabase, not in frontend code:
+
+```sh
+npx supabase secrets set GEMINI_API_KEY="your-real-key" GEMINI_MODEL="gemini-3-flash-preview" --project-ref agxarewpwagkrceqfkte
+```
+
+`SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided automatically inside hosted Supabase Edge Functions. The service-role key must never be copied into `.env` or a browser file.
+
+## Deploy Edge Functions
+
+Deploy both functions after applying the database migration:
+
+```sh
+npx supabase functions deploy process-document --project-ref agxarewpwagkrceqfkte
+npx supabase functions deploy chat-document --project-ref agxarewpwagkrceqfkte
+```
+
+JWT verification remains enabled. The current unauthenticated frontend invokes the functions with the project's anonymous token.
+
+## Install and run the frontend
+
+```sh
+npm ci
 npm run dev
 ```
 
-**Edit a file directly in GitHub**
+The development server runs at `http://localhost:8080`.
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+For a production build and preview:
 
-**Use GitHub Codespaces**
+```sh
+npm run build
+npm run preview
+```
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+## Verification commands
 
-## What technologies are used for this project?
+```sh
+npx tsc --noEmit
+npm run build
+npm run lint
+```
 
-This project is built with:
+There is no automated test runner yet. Test upload, extraction, chat history, citations, and failure states manually after deploying the migration and functions.
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+## Current MVP flow
 
-## How can I deploy this project?
+1. The browser validates and uploads a PDF to the private `documents` Storage bucket, then inserts its metadata.
+2. The browser invokes `process-document` with the new document ID and waits before opening Chat.
+3. The Edge Function downloads the private PDF using its server-only service-role client, extracts per-page text, stores chunks, and marks the document `ready` or `failed`.
+4. Chat lists persisted ready documents and loads their saved message history through `chat-document`.
+5. For a question, the Edge Function ranks chunks with PostgreSQL full-text search, sends only retrieved text to Gemini, validates cited chunk IDs, saves both messages, and returns the answer with page excerpts.
 
-Simply open [Lovable](https://lovable.dev/projects/c122ce7a-d67d-425b-889b-5dbdb2a6d36a) and click on Share -> Publish.
+## Temporary policy warning
 
-## Can I connect a custom domain to my Lovable project?
+This remains an unauthenticated prototype. Anyone who has the public project key can list document display metadata and invoke the Edge Functions for a known document ID. Extracted chunks and messages have RLS enabled with no anonymous table policies, and the Storage bucket has no anonymous read policy, but the functions currently do not have user ownership to enforce.
 
-Yes, you can!
+Before real users or sensitive documents are supported, add authentication and a `user_id` owner to documents, store objects under paths scoped to `auth.uid()`, replace anonymous upload/insert policies with owner-only authenticated policies, and make both Edge Functions verify that the caller owns the requested document.
 
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
+## MVP limitations
 
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+- Image-only/scanned PDFs are rejected because OCR is not implemented.
+- Retrieval is keyword/full-text ranking, not semantic vector search.
+- One selected document is queried at a time.
+- There is no authentication, ownership isolation, rate limiting, automated test suite, or background job queue.
+- PDF processing runs synchronously within Edge Function runtime limits; very complex 20 MB PDFs may need a queued worker later.

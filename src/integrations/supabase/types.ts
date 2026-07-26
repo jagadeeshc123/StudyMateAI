@@ -14,13 +14,133 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      documents: {
+        Row: {
+          created_at: string
+          file_size: number
+          id: string
+          mime_type: string
+          original_file_name: string
+          processing_status: string
+          storage_path: string
+        }
+        Insert: {
+          created_at?: string
+          file_size: number
+          id?: string
+          mime_type?: string
+          original_file_name: string
+          processing_status?: string
+          storage_path: string
+        }
+        Update: {
+          created_at?: string
+          file_size?: number
+          id?: string
+          mime_type?: string
+          original_file_name?: string
+          processing_status?: string
+          storage_path?: string
+        }
+        Relationships: []
+      }
+      document_chunks: {
+        Row: {
+          chunk_index: number
+          content: string
+          created_at: string
+          document_id: string
+          id: string
+          page_number: number
+        }
+        Insert: {
+          chunk_index: number
+          content: string
+          created_at?: string
+          document_id: string
+          id?: string
+          page_number: number
+        }
+        Update: {
+          chunk_index?: number
+          content?: string
+          created_at?: string
+          document_id?: string
+          id?: string
+          page_number?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "document_chunks_document_id_fkey"
+            columns: ["document_id"]
+            isOneToOne: false
+            referencedRelation: "documents"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      messages: {
+        Row: {
+          content: string
+          created_at: string
+          document_id: string
+          id: string
+          role: string
+        }
+        Insert: {
+          content: string
+          created_at?: string
+          document_id: string
+          id?: string
+          role: string
+        }
+        Update: {
+          content?: string
+          created_at?: string
+          document_id?: string
+          id?: string
+          role?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "messages_document_id_fkey"
+            columns: ["document_id"]
+            isOneToOne: false
+            referencedRelation: "documents"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Views: {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      list_documents: {
+        Args: Record<PropertyKey, never>
+        Returns: {
+          created_at: string
+          file_size: number
+          id: string
+          mime_type: string
+          original_file_name: string
+          processing_status: string
+        }[]
+      }
+      search_document_chunks: {
+        Args: {
+          match_count?: number
+          search_query: string
+          target_document_id: string
+        }
+        Returns: {
+          chunk_index: number
+          content: string
+          id: string
+          page_number: number
+          rank: number
+        }[]
+      }
     }
     Enums: {
       [_ in never]: never

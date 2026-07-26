@@ -5,11 +5,46 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Upload as UploadIcon, File, X } from "lucide-react";
 import { toast } from "sonner";
+import {
+  processDocument,
+  uploadDocument,
+  validatePdfFile,
+} from "@/integrations/supabase/documents";
+
+interface UploadProgress {
+  current: number;
+  total: number;
+  fileName: string;
+  phase: "uploading" | "processing";
+}
 
 const Upload = () => {
   const [files, setFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+  const [workflowError, setWorkflowError] = useState<string | null>(null);
   const navigate = useNavigate();
+
+  const isUploading = uploadProgress !== null;
+
+  const addFiles = async (candidateFiles: File[]) => {
+    const validFiles: File[] = [];
+
+    for (const file of candidateFiles) {
+      const validationError = await validatePdfFile(file);
+
+      if (validationError) {
+        toast.error(`${file.name}: ${validationError}`);
+      } else {
+        validFiles.push(file);
+      }
+    }
+
+    if (validFiles.length > 0) {
+      setFiles((previousFiles) => [...previousFiles, ...validFiles]);
+      toast.success(`Added ${validFiles.length} PDF file(s)`);
+    }
+  };
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -20,31 +55,18 @@ const Upload = () => {
     setIsDragging(false);
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    
-    const droppedFiles = Array.from(e.dataTransfer.files).filter(
-      file => file.type === "application/pdf"
-    );
-    
-    if (droppedFiles.length > 0) {
-      setFiles(prev => [...prev, ...droppedFiles]);
-      toast.success(`Added ${droppedFiles.length} PDF file(s)`);
-    } else {
-      toast.error("Please upload PDF files only");
+
+    if (!isUploading) {
+      await addFiles(Array.from(e.dataTransfer.files));
     }
   };
 
-  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFiles = Array.from(e.target.files || []).filter(
-      file => file.type === "application/pdf"
-    );
-    
-    if (selectedFiles.length > 0) {
-      setFiles(prev => [...prev, ...selectedFiles]);
-      toast.success(`Added ${selectedFiles.length} PDF file(s)`);
-    }
+  const handleFileInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    await addFiles(Array.from(e.target.files || []));
+    e.target.value = "";
   };
 
   const removeFile = (index: number) => {
@@ -52,15 +74,70 @@ const Upload = () => {
     toast.info("File removed");
   };
 
-  const handleUpload = () => {
+  const handleUpload = async () => {
     if (files.length === 0) {
       toast.error("Please add at least one PDF file");
       return;
     }
-    
-    toast.success("PDFs uploaded successfully!");
-    // Store files in sessionStorage for demo purposes
-    sessionStorage.setItem("uploadedPDFs", JSON.stringify(files.map(f => f.name)));
+
+    setWorkflowError(null);
+    const uploadFailures: File[] = [];
+    const processingFailures: string[] = [];
+    let readyDocumentCount = 0;
+
+    for (const [index, file] of files.entries()) {
+      setUploadProgress({
+        current: index + 1,
+        total: files.length,
+        fileName: file.name,
+        phase: "uploading",
+      });
+
+      try {
+        const document = await uploadDocument(file);
+        setUploadProgress({
+          current: index + 1,
+          total: files.length,
+          fileName: file.name,
+          phase: "processing",
+        });
+
+        try {
+          await processDocument(document.id);
+          readyDocumentCount += 1;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "PDF text extraction failed.";
+          processingFailures.push(`${file.name}: ${message}`);
+          toast.error(`${file.name}: ${message}`);
+        }
+      } catch (error) {
+        uploadFailures.push(file);
+        toast.error(error instanceof Error ? error.message : `Could not upload ${file.name}.`);
+      }
+    }
+
+    setUploadProgress(null);
+    setFiles(uploadFailures);
+
+    if (uploadFailures.length > 0 || processingFailures.length > 0) {
+      if (readyDocumentCount > 0) {
+        toast.success(`${readyDocumentCount} document(s) uploaded and processed successfully.`);
+      }
+
+      const errorSummary = [
+        uploadFailures.length > 0
+          ? `${uploadFailures.length} upload(s) failed and remain selected so you can retry.`
+          : null,
+        processingFailures.length > 0
+          ? `${processingFailures.length} PDF(s) uploaded but could not be processed: ${processingFailures.join(" ")}`
+          : null,
+      ].filter(Boolean).join(" ");
+
+      setWorkflowError(errorSummary);
+      return;
+    }
+
+    toast.success(`${readyDocumentCount} document(s) uploaded and processed successfully.`);
     navigate("/chat");
   };
 
@@ -121,6 +198,7 @@ const Upload = () => {
                   multiple
                   className="hidden"
                   onChange={handleFileInput}
+                  disabled={isUploading}
                 />
               </div>
 
@@ -145,6 +223,8 @@ const Upload = () => {
                         variant="ghost"
                         size="icon"
                         onClick={() => removeFile(index)}
+                        disabled={isUploading}
+                        aria-label={`Remove ${file.name}`}
                       >
                         <X className="h-4 w-4" />
                       </Button>
@@ -154,16 +234,31 @@ const Upload = () => {
               )}
 
               <div className="mt-6 flex justify-end">
+                {uploadProgress && (
+                  <p className="mr-auto self-center text-sm text-muted-foreground" role="status">
+                    {uploadProgress.phase === "uploading" ? "Uploading" : "Extracting text from"}{" "}
+                    {uploadProgress.current} of {uploadProgress.total}: {uploadProgress.fileName}
+                  </p>
+                )}
                 <Button
                   variant="hero"
                   size="lg"
                   onClick={handleUpload}
-                  disabled={files.length === 0}
+                  disabled={files.length === 0 || isUploading}
                 >
                   <UploadIcon className="mr-2 h-5 w-5" />
-                  Upload & Start Chatting
+                  {isUploading
+                    ? uploadProgress.phase === "uploading"
+                      ? "Uploading..."
+                      : "Processing..."
+                    : "Upload & Start Chatting"}
                 </Button>
               </div>
+              {workflowError && (
+                <p className="mt-4 text-sm text-destructive" role="alert">
+                  {workflowError}
+                </p>
+              )}
             </CardContent>
           </Card>
         </div>

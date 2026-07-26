@@ -41,7 +41,7 @@ const Home = () => {
               <Link to="/chat">
                 <Button variant="outline" size="lg" className="w-full sm:w-auto">
                   <MessageSquare className="mr-2 h-5 w-5" />
-                  Try Demo Chat
+                  Chat with Documents
                 </Button>
               </Link>
             </div>
