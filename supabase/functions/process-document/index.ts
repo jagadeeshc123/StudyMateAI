@@ -1,5 +1,6 @@
 import { extractText, getDocumentProxy } from "npm:unpdf@1.8.0";
 import { corsHeaders, jsonResponse } from "../_shared/cors.ts";
+import { HttpError, requireAuthenticatedUser } from "../_shared/auth.ts";
 import { createSupabaseAdminClient } from "../_shared/supabase-admin.ts";
 import { chunkExtractedPages } from "../_shared/text.ts";
 
@@ -23,11 +24,12 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: "Only POST requests are supported." }, 405);
   }
 
-  const supabase = createSupabaseAdminClient();
+  let supabase: ReturnType<typeof createSupabaseAdminClient> | null = null;
   let documentId: string | null = null;
   let documentExists = false;
 
   try {
+    const { user, supabase: callerSupabase } = await requireAuthenticatedUser(request);
     const body = (await request.json()) as ProcessDocumentBody;
     documentId = typeof body.documentId === "string" ? body.documentId : null;
 
@@ -35,18 +37,32 @@ Deno.serve(async (request) => {
       return jsonResponse({ error: "A valid document ID is required." }, 400);
     }
 
-    const { data: document, error: documentError } = await supabase
+    const { data: document, error: documentError } = await callerSupabase
       .from("documents")
-      .select("id, storage_path, mime_type")
+      .select("id, user_id, storage_path, mime_type, processing_status")
       .eq("id", documentId)
+      .eq("user_id", user.id)
       .maybeSingle();
 
     if (documentError) {
       throw new Error(`Could not load the document record: ${documentError.message}`);
     }
 
-    if (!document) {
-      return jsonResponse({ error: "Document not found." }, 404);
+    if (!document || document.user_id !== user.id) {
+      const ownershipLookup = createSupabaseAdminClient();
+      const { data: existingDocument, error: lookupError } = await ownershipLookup
+        .from("documents")
+        .select("id")
+        .eq("id", documentId)
+        .maybeSingle();
+
+      if (lookupError) {
+        throw new Error(`Could not verify document ownership: ${lookupError.message}`);
+      }
+
+      return existingDocument
+        ? jsonResponse({ error: "You do not have access to this document." }, 403)
+        : jsonResponse({ error: "Document not found." }, 404);
     }
 
     documentExists = true;
@@ -55,13 +71,43 @@ Deno.serve(async (request) => {
       throw new Error("The stored document is not a PDF.");
     }
 
-    const { error: processingStatusError } = await supabase
+    if (document.processing_status !== "uploaded" && document.processing_status !== "failed") {
+      return jsonResponse({
+        error: document.processing_status === "processing"
+          ? "This document is already processing."
+          : `This document cannot be processed while its status is ${document.processing_status}.`,
+      }, 409);
+    }
+
+    supabase = createSupabaseAdminClient();
+    const { data: claimedDocument, error: processingStatusError } = await supabase
       .from("documents")
-      .update({ processing_status: "processing" })
-      .eq("id", documentId);
+      .update({
+        processing_status: "processing",
+        processing_error: null,
+        page_count: null,
+      })
+      .eq("id", documentId)
+      .eq("user_id", user.id)
+      .in("processing_status", ["uploaded", "failed"])
+      .select("id")
+      .maybeSingle();
 
     if (processingStatusError) {
       throw new Error(`Could not mark the document as processing: ${processingStatusError.message}`);
+    }
+
+    if (!claimedDocument) {
+      return jsonResponse({ error: "This document is already processing or is no longer retryable." }, 409);
+    }
+
+    const { error: clearChunksError } = await supabase
+      .from("document_chunks")
+      .delete()
+      .eq("document_id", documentId);
+
+    if (clearChunksError) {
+      throw new Error(`Could not clear previous document chunks: ${clearChunksError.message}`);
     }
 
     const { data: pdfFile, error: downloadError } = await supabase.storage
@@ -82,15 +128,6 @@ Deno.serve(async (request) => {
       throw new Error("No searchable text was found in this PDF. Scanned/image-only PDFs need OCR, which is not part of this MVP.");
     }
 
-    const { error: deleteError } = await supabase
-      .from("document_chunks")
-      .delete()
-      .eq("document_id", documentId);
-
-    if (deleteError) {
-      throw new Error(`Could not replace existing document chunks: ${deleteError.message}`);
-    }
-
     for (let offset = 0; offset < chunks.length; offset += INSERT_BATCH_SIZE) {
       const batch = chunks.slice(offset, offset + INSERT_BATCH_SIZE).map((chunk) => ({
         ...chunk,
@@ -103,13 +140,25 @@ Deno.serve(async (request) => {
       }
     }
 
-    const { error: readyStatusError } = await supabase
+    const { data: readyDocument, error: readyStatusError } = await supabase
       .from("documents")
-      .update({ processing_status: "ready" })
-      .eq("id", documentId);
+      .update({
+        processing_status: "ready",
+        processing_error: null,
+        page_count: extracted.totalPages,
+      })
+      .eq("id", documentId)
+      .eq("user_id", user.id)
+      .eq("processing_status", "processing")
+      .select("id")
+      .maybeSingle();
 
     if (readyStatusError) {
       throw new Error(`The text was extracted, but the ready status could not be saved: ${readyStatusError.message}`);
+    }
+
+    if (!readyDocument) {
+      throw new Error("The document changed or was deleted while processing.");
     }
 
     return jsonResponse({
@@ -119,14 +168,23 @@ Deno.serve(async (request) => {
       chunkCount: chunks.length,
     });
   } catch (error) {
+    if (error instanceof HttpError) {
+      return jsonResponse({ error: error.message }, error.status);
+    }
+
     const errorMessage = getErrorMessage(error);
     console.error("process-document failed", { documentId, error: errorMessage });
 
-    if (documentId && documentExists) {
+    if (supabase && documentId && documentExists) {
       const { error: failedStatusError } = await supabase
         .from("documents")
-        .update({ processing_status: "failed" })
-        .eq("id", documentId);
+        .update({
+          processing_status: "failed",
+          processing_error: errorMessage,
+          page_count: null,
+        })
+        .eq("id", documentId)
+        .eq("processing_status", "processing");
 
       if (failedStatusError) {
         console.error("Could not mark document as failed", failedStatusError.message);

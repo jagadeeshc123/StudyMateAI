@@ -24,12 +24,12 @@ Only use the browser-safe publishable/anonymous key. Never put a Supabase servic
 
 ## Database and private Storage setup
 
-The version-controlled migrations create the private `documents` bucket, `documents`, `document_chunks`, and `messages` tables, relevant indexes, temporary prototype policies, and the server-only text-search function.
+The version-controlled migrations create the private `documents` bucket, the application tables, authenticated ownership policies, and the server-only text-search function.
 
-Link the Supabase CLI and apply both migrations:
+Link the Supabase CLI and apply all migrations:
 
 ```sh
-npx supabase link --project-ref agxarewpwagkrceqfkte
+npx supabase link --project-ref "$PROJECT_REF"
 npx supabase db push
 ```
 
@@ -37,29 +37,39 @@ Alternatively, run these files in timestamp order using **Supabase Dashboard -> 
 
 1. `supabase/migrations/20260726183000_create_documents.sql`
 2. `supabase/migrations/20260726213000_add_document_processing_and_chat.sql`
+3. `supabase/migrations/20260727023000_add_authentication_and_ownership.sql`
+4. `supabase/migrations/20260727130000_phase1_document_management.sql`
+5. `supabase/migrations/20260727160000_phase1_security_hardening.sql`
 
 In **Supabase Dashboard -> Storage**, confirm the `documents` bucket exists and **Public bucket** is disabled. The first migration creates and configures it automatically when run as written.
+
+The ownership migration archives all pre-authentication database rows in the API-inaccessible `studymate_legacy_archive` schema, removes them from the live tables, and then makes `documents.user_id` required. It deliberately does not guess an owner. Legacy files under `documents/anonymous/` remain private and inaccessible; after validating the archive, remove that folder through the Storage Dashboard or Storage API. Do not delete rows directly from `storage.objects` with SQL.
+
+## Authentication settings
+
+Email/password authentication is enabled by default in Supabase. In **Authentication -> URL Configuration**, set the Site URL and allowed redirect URLs for the frontend (for example `http://localhost:8080` in development and the production origin after deployment). In **Authentication -> Providers -> Email**, choose whether new accounts must confirm their email. When confirmation is required, the sign-up screen asks the user to confirm before logging in.
 
 ## Server-only AI secrets
 
 The chat Edge Function uses the Gemini Interactions API. `gemini-3-flash-preview` is the default because it supports structured output and currently has a Gemini API free tier. Set secrets in Supabase, not in frontend code:
 
 ```sh
-npx supabase secrets set GEMINI_API_KEY="your-real-key" GEMINI_MODEL="gemini-3-flash-preview" --project-ref agxarewpwagkrceqfkte
+npx supabase secrets set GEMINI_API_KEY="your-real-key" GEMINI_MODEL="gemini-3-flash-preview" --project-ref "$PROJECT_REF"
 ```
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided automatically inside hosted Supabase Edge Functions. The service-role key must never be copied into `.env` or a browser file.
 
 ## Deploy Edge Functions
 
-Deploy both functions after applying the database migration:
+Deploy all functions after applying the database migrations:
 
 ```sh
-npx supabase functions deploy process-document --project-ref agxarewpwagkrceqfkte
-npx supabase functions deploy chat-document --project-ref agxarewpwagkrceqfkte
+npx supabase functions deploy process-document --project-ref "$PROJECT_REF"
+npx supabase functions deploy chat-document --project-ref "$PROJECT_REF"
+npx supabase functions deploy delete-document --project-ref "$PROJECT_REF"
 ```
 
-JWT verification remains enabled. The current unauthenticated frontend invokes the functions with the project's anonymous token.
+JWT verification remains enabled. The frontend explicitly sends the current user's access token, and each function calls `auth.getUser()`, checks document ownership, and only then performs service-role operations.
 
 ## Install and run the frontend
 
@@ -81,30 +91,31 @@ npm run preview
 
 ```sh
 npx tsc --noEmit
+deno check --config supabase/functions/deno.json supabase/functions/process-document/index.ts supabase/functions/chat-document/index.ts supabase/functions/delete-document/index.ts
 npm run build
 npm run lint
+npx supabase test db supabase/tests/ownership_rls.sql
 ```
 
-There is no automated test runner yet. Test upload, extraction, chat history, citations, and failure states manually after deploying the migration and functions.
+The SQL test checks cross-user RLS for documents, chunks, messages, document statistics, rename behavior, display-name validation, and history clearing against a local Supabase database. Also perform the two-account browser test after deploying the migration and functions.
 
 ## Current MVP flow
 
-1. The browser validates and uploads a PDF to the private `documents` Storage bucket, then inserts its metadata.
-2. The browser invokes `process-document` with the new document ID and waits before opening Chat.
-3. The Edge Function downloads the private PDF using its server-only service-role client, extracts per-page text, stores chunks, and marks the document `ready` or `failed`.
-4. Chat lists persisted ready documents and loads their saved message history through `chat-document`.
-5. For a question, the Edge Function ranks chunks with PostgreSQL full-text search, sends only retrieved text to Gemini, validates cited chunk IDs, saves both messages, and returns the answer with page excerpts.
-
-## Temporary policy warning
-
-This remains an unauthenticated prototype. Anyone who has the public project key can list document display metadata and invoke the Edge Functions for a known document ID. Extracted chunks and messages have RLS enabled with no anonymous table policies, and the Storage bucket has no anonymous read policy, but the functions currently do not have user ownership to enforce.
-
-Before real users or sensitive documents are supported, add authentication and a `user_id` owner to documents, store objects under paths scoped to `auth.uid()`, replace anonymous upload/insert policies with owner-only authenticated policies, and make both Edge Functions verify that the caller owns the requested document.
+1. Supabase restores the persisted session; `/upload`, `/documents`, `/chat`, and `/history` redirect to `/login` if no authenticated user exists.
+2. The browser validates and uploads a PDF under `<auth.uid()>/<document-id>.pdf`, then inserts metadata with the authenticated user's ID.
+3. The browser invokes `process-document` with the access token and waits before opening Chat.
+4. The Edge Function authenticates the caller, verifies ownership, downloads the private PDF, extracts per-page text, stores chunks, and marks the document `ready` or `failed`.
+5. Documents lists owner-scoped status, errors, and statistics in one request. Rename changes only the display name; deletion runs through the authenticated `delete-document` function.
+6. History groups saved Q&A by owned document and uses an authenticated owner-scoped SQL function for clearing one document or all history without deleting PDFs.
+7. Chat intersects the current user's ready documents with the user-scoped latest-upload batch, persists that batch across refresh, and replaces it when **Open in Chat** is used from Documents or History.
+8. The answer-depth selector sends a server-clamped `concise`, `balanced`, or `detailed` mode. Ordinary questions use bounded retrieval; complete-document intents use ordered all-chunk or hierarchical summarization. Citations are validated against stored chunks and provide expandable database excerpts.
 
 ## MVP limitations
 
 - Image-only/scanned PDFs are rejected because OCR is not implemented.
 - Retrieval is keyword/full-text ranking, not semantic vector search.
 - One selected document is queried at a time.
-- There is no authentication, ownership isolation, rate limiting, automated test suite, or background job queue.
+- There is no password-reset UI, rate limiting, browser E2E test suite, or background job queue.
 - PDF processing runs synchronously within Edge Function runtime limits; very complex 20 MB PDFs may need a queued worker later.
+
+The reviewed staged-worker design is documented in `docs/large-pdf-worker-architecture.md`. The 20 MB limit remains unchanged because the current PDF library loads and extracts the complete PDF within one Edge Function request; batched inserts alone do not make that operation resumable.

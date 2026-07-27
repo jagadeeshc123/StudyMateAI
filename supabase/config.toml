@@ -1,1 +1,10 @@
-project_id = "agxarewpwagkrceqfkte"
+project_id = "sdxrlczdzcpqwppytzuv"
+
+[functions.process-document]
+verify_jwt = true
+
+[functions.chat-document]
+verify_jwt = true
+
+[functions.delete-document]
+verify_jwt = true

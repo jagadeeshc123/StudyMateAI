@@ -17,32 +17,52 @@ export type Database = {
       documents: {
         Row: {
           created_at: string
+          display_name: string | null
           file_size: number
           id: string
           mime_type: string
           original_file_name: string
+          page_count: number | null
+          processing_error: string | null
           processing_status: string
           storage_path: string
+          user_id: string
         }
         Insert: {
           created_at?: string
+          display_name?: string | null
           file_size: number
           id?: string
           mime_type?: string
           original_file_name: string
+          page_count?: number | null
+          processing_error?: string | null
           processing_status?: string
           storage_path: string
+          user_id: string
         }
         Update: {
           created_at?: string
+          display_name?: string | null
           file_size?: number
           id?: string
           mime_type?: string
           original_file_name?: string
+          page_count?: number | null
+          processing_error?: string | null
           processing_status?: string
           storage_path?: string
+          user_id?: string
         }
-        Relationships: []
+        Relationships: [
+          {
+            foreignKeyName: "documents_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       document_chunks: {
         Row: {
@@ -116,6 +136,28 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      clear_user_history: {
+        Args: {
+          target_document_id?: string | null
+        }
+        Returns: undefined
+      }
+      list_user_documents: {
+        Args: Record<PropertyKey, never>
+        Returns: {
+          chunk_count: number
+          created_at: string
+          display_name: string | null
+          file_size: number
+          id: string
+          message_count: number
+          mime_type: string
+          original_file_name: string
+          page_count: number | null
+          processing_error: string | null
+          processing_status: string
+        }[]
+      }
       list_documents: {
         Args: Record<PropertyKey, never>
         Returns: {

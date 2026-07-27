@@ -4,18 +4,25 @@ import { invokeEdgeFunction } from "@/integrations/supabase/edge-functions";
 
 export const DOCUMENTS_BUCKET = "documents";
 export const MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024;
+export const MAX_DISPLAY_NAME_LENGTH = 150;
 
 const PDF_MIME_TYPE = "application/pdf";
 const PDF_SIGNATURE = [0x25, 0x50, 0x44, 0x46, 0x2d];
 
 export type DocumentRecord = Tables<"documents">;
-export type DocumentSummary = Database["public"]["Functions"]["list_documents"]["Returns"][number];
+export type ManagedDocument = Database["public"]["Functions"]["list_user_documents"]["Returns"][number];
+export type DocumentSummary = ManagedDocument;
 
 export interface ProcessDocumentResult {
   documentId: string;
   status: "ready";
   pageCount: number;
   chunkCount: number;
+}
+
+export interface DeleteDocumentResult {
+  documentId: string;
+  deleted: true;
 }
 
 export class DocumentStorageError extends Error {
@@ -52,6 +59,24 @@ export async function validatePdfFile(file: File): Promise<string | null> {
   return null;
 }
 
+export function validateDisplayName(value: string): string | null {
+  const trimmedValue = value.trim();
+
+  if (!trimmedValue) {
+    return "Display name cannot be empty.";
+  }
+
+  if (Array.from(trimmedValue).length > MAX_DISPLAY_NAME_LENGTH) {
+    return `Display name must be ${MAX_DISPLAY_NAME_LENGTH} characters or fewer.`;
+  }
+
+  if (/\p{Cc}/u.test(trimmedValue)) {
+    return "Display name cannot contain control characters.";
+  }
+
+  return null;
+}
+
 export async function uploadDocument(file: File): Promise<DocumentRecord> {
   const validationError = await validatePdfFile(file);
 
@@ -59,9 +84,15 @@ export async function uploadDocument(file: File): Promise<DocumentRecord> {
     throw new DocumentStorageError(`${file.name}: ${validationError}`);
   }
 
+  const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+  const user = sessionData.session?.user;
+
+  if (sessionError || !user) {
+    throw new DocumentStorageError("Your session has expired. Log in again before uploading.");
+  }
+
   const documentId = crypto.randomUUID();
-  const createdAt = new Date().toISOString();
-  const storagePath = `anonymous/${documentId}.pdf`;
+  const storagePath = `${user.id}/${documentId}.pdf`;
   const { error: storageError } = await supabase.storage
     .from(DOCUMENTS_BUCKET)
     .upload(storagePath, file, {
@@ -74,19 +105,21 @@ export async function uploadDocument(file: File): Promise<DocumentRecord> {
     throw new DocumentStorageError(`Could not upload ${file.name}: ${storageError.message}`);
   }
 
-  const documentToInsert: DocumentRecord = {
+  const documentToInsert: Database["public"]["Tables"]["documents"]["Insert"] = {
     id: documentId,
+    user_id: user.id,
     original_file_name: file.name,
     storage_path: storagePath,
     file_size: file.size,
     mime_type: PDF_MIME_TYPE,
     processing_status: "uploaded",
-    created_at: createdAt,
   };
 
-  const { error: databaseError } = await supabase
+  const { data: document, error: databaseError } = await supabase
     .from("documents")
-    .insert(documentToInsert);
+    .insert(documentToInsert)
+    .select()
+    .single();
 
   if (databaseError) {
     const { error: cleanupError } = await supabase.storage
@@ -102,17 +135,64 @@ export async function uploadDocument(file: File): Promise<DocumentRecord> {
     );
   }
 
-  return documentToInsert;
+  return document;
 }
 
 export async function listDocuments(): Promise<DocumentSummary[]> {
-  const { data, error } = await supabase.rpc("list_documents");
+  const documents = await listManagedDocuments();
+  return documents.filter((document) => document.processing_status === "ready");
+}
+
+export async function listManagedDocuments(): Promise<ManagedDocument[]> {
+  const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+  const user = sessionData.session?.user;
+
+  if (sessionError || !user) {
+    throw new DocumentStorageError("Your session has expired. Log in again to view documents.");
+  }
+
+  const { data, error } = await supabase.rpc("list_user_documents");
 
   if (error) {
     throw new DocumentStorageError(`Could not load uploaded documents: ${error.message}`);
   }
 
-  return data;
+  return data ?? [];
+}
+
+export async function renameDocument(documentId: string, displayName: string): Promise<void> {
+  const validationError = validateDisplayName(displayName);
+
+  if (validationError) {
+    throw new DocumentStorageError(validationError);
+  }
+
+  const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+  const user = sessionData.session?.user;
+
+  if (sessionError || !user) {
+    throw new DocumentStorageError("Your session has expired. Log in again before renaming.");
+  }
+
+  const { data, error } = await supabase
+    .from("documents")
+    .update({ display_name: displayName.trim() })
+    .eq("id", documentId)
+    .eq("user_id", user.id)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    throw new DocumentStorageError(`Could not rename the document: ${error.message}`);
+  }
+
+  if (!data) {
+    throw new DocumentStorageError("Document not found or you do not have permission to rename it.");
+  }
+}
+
+export async function deleteDocument(documentId: string): Promise<DeleteDocumentResult> {
+  return invokeEdgeFunction<DeleteDocumentResult>("delete-document", { documentId });
 }
 
 export async function processDocument(documentId: string): Promise<ProcessDocumentResult> {

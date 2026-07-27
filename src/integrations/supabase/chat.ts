@@ -1,9 +1,13 @@
 import { invokeEdgeFunction } from "@/integrations/supabase/edge-functions";
 
 export interface SourceCitation {
+  chunkId?: string;
   pageNumber: number;
   excerpt: string;
+  fullExcerpt?: string;
 }
+
+export type ResponseMode = "concise" | "balanced" | "detailed";
 
 export interface ChatAnswer {
   answer: string;
@@ -23,8 +27,18 @@ interface ChatHistoryResponse {
   messages: PersistedMessage[];
 }
 
-export async function askDocument(documentId: string, question: string): Promise<ChatAnswer> {
-  return invokeEdgeFunction<ChatAnswer>("chat-document", { documentId, question });
+export async function askDocument(
+  documentId: string,
+  question: string,
+  responseMode: ResponseMode = "balanced",
+): Promise<ChatAnswer> {
+  const topK = responseMode === "concise" ? 3 : responseMode === "detailed" ? 8 : 6;
+  return invokeEdgeFunction<ChatAnswer>("chat-document", {
+    documentId,
+    question,
+    top_k: topK,
+    response_mode: responseMode,
+  });
 }
 
 export async function loadChatHistory(documentId: string): Promise<PersistedMessage[]> {

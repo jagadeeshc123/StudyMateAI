@@ -1,15 +1,27 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import Navbar from "@/components/Navbar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import SourceExcerpt from "@/components/SourceExcerpt";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Send, BookOpen, Sparkles } from "lucide-react";
 import { toast } from "sonner";
+import { useAuth } from "@/contexts/AuthContext";
+import { getActiveBatch, setActiveBatch } from "@/integrations/supabase/active-batch";
 import {
   askDocument,
   loadChatHistory,
   type PersistedMessage,
+  type ResponseMode,
   type SourceCitation,
 } from "@/integrations/supabase/chat";
 import {
@@ -71,6 +83,11 @@ const Chat = () => {
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
   const [documentsLoading, setDocumentsLoading] = useState(true);
   const [documentsError, setDocumentsError] = useState<string | null>(null);
+  const [responseMode, setResponseMode] = useState<ResponseMode>("balanced");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const requestedDocumentId = searchParams.get("document");
+  const { user } = useAuth();
   const readyDocuments = useMemo(
     () => documents.filter((document) => document.processing_status === "ready"),
     [documents],
@@ -81,22 +98,44 @@ const Chat = () => {
     let isActive = true;
 
     const loadDocuments = async () => {
+      setDocuments([]);
+      setSelectedDocumentId(null);
+      setMessages([]);
+      setDocumentsLoading(true);
+
       try {
-        const uploadedDocuments = await listDocuments();
+        const activeDocumentIds = user ? getActiveBatch(user.id) : [];
+        const ownedReadyDocuments = await listDocuments();
+        const ownedDocumentsById = new Map(
+          ownedReadyDocuments.map((document) => [document.id, document]),
+        );
+        const uploadedDocuments = activeDocumentIds
+          .map((id) => ownedDocumentsById.get(id))
+          .filter((document): document is DocumentSummary => Boolean(document));
+
+        if (user) setActiveBatch(user.id, uploadedDocuments.map((document) => document.id));
 
         if (isActive) {
           const firstReadyDocument = uploadedDocuments.find(
             (document) => document.processing_status === "ready",
           );
+          const requestedDocument = uploadedDocuments.find(
+            (document) => document.id === requestedDocumentId && document.processing_status === "ready",
+          );
+          const requestedDocumentUnavailable = Boolean(requestedDocumentId && !requestedDocument);
           setDocuments(uploadedDocuments);
           setSelectedDocumentId((currentId) =>
-            uploadedDocuments.some(
+            requestedDocumentUnavailable
+              ? null
+              : uploadedDocuments.some(
               (document) => document.id === currentId && document.processing_status === "ready",
             )
               ? currentId
-              : firstReadyDocument?.id ?? null,
+              : requestedDocument?.id ?? firstReadyDocument?.id ?? null,
           );
-          setDocumentsError(null);
+          setDocumentsError(requestedDocumentUnavailable
+            ? "The requested document is not available in your active batch."
+            : null);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : "Could not load uploaded documents.";
@@ -117,7 +156,7 @@ const Chat = () => {
     return () => {
       isActive = false;
     };
-  }, []);
+  }, [requestedDocumentId, user]);
 
   useEffect(() => {
     let isActive = true;
@@ -182,7 +221,7 @@ const Chat = () => {
     setIsLoading(true);
 
     try {
-      const response = await askDocument(selectedDocumentId, question);
+      const response = await askDocument(selectedDocumentId, question, responseMode);
       const assistantMessage: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -229,7 +268,10 @@ const Chat = () => {
                     <button
                       key={document.id}
                       type="button"
-                      onClick={() => setSelectedDocumentId(document.id)}
+                      onClick={() => {
+                        setSelectedDocumentId(document.id);
+                        setSearchParams({ document: document.id }, { replace: true });
+                      }}
                       disabled={isLoading || historyLoading}
                       aria-pressed={document.id === selectedDocumentId}
                       className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
@@ -239,15 +281,20 @@ const Chat = () => {
                       }`}
                     >
                       <BookOpen className="mr-1 h-3 w-3" />
-                      {document.original_file_name}
+                      {document.display_name ?? document.original_file_name}
                     </button>
                   ))}
                 </div>
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground">
-                No processed documents are ready. Upload a searchable PDF to get started.
-              </p>
+              <div className="flex flex-wrap items-center gap-3">
+                <p className="text-sm text-muted-foreground">
+                  No ready documents are in the active upload batch.
+                </p>
+                <Button type="button" variant="outline" size="sm" onClick={() => navigate("/documents")}>
+                  Add from Documents
+                </Button>
+              </div>
             )}
             {pendingCount > 0 && (
               <p className="mt-2 text-sm text-muted-foreground" role="status">
@@ -272,7 +319,7 @@ const Chat = () => {
                   ) : messages.length === 0 ? (
                     <p className="text-sm text-muted-foreground">
                       {selectedDocument
-                        ? `Ask a question about ${selectedDocument.original_file_name}.`
+                        ? `Ask a question about ${selectedDocument.display_name ?? selectedDocument.original_file_name}.`
                         : "Select a ready document before asking a question."}
                     </p>
                   ) : (
@@ -299,10 +346,13 @@ const Chat = () => {
                             <div className="mt-3 space-y-2 border-t border-border/60 pt-3">
                               <p className="text-xs font-semibold">Sources</p>
                               {message.sources.map((source, index) => (
-                                <div key={`${source.pageNumber}-${index}`} className="text-xs text-muted-foreground">
-                                  <p className="font-medium text-foreground">Page {source.pageNumber}</p>
-                                  <p className="mt-1">{source.excerpt}</p>
-                                </div>
+                                <SourceExcerpt
+                                  key={source.chunkId ?? `${source.pageNumber}-${index}`}
+                                  source={source}
+                                  documentName={selectedDocument
+                                    ? selectedDocument.display_name ?? selectedDocument.original_file_name
+                                    : undefined}
+                                />
                               ))}
                             </div>
                           )}
@@ -328,6 +378,19 @@ const Chat = () => {
 
           <Card className="border-2">
             <CardContent className="p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <label htmlFor="source-context" className="text-sm font-medium">Answer depth</label>
+                <Select value={responseMode} onValueChange={(value) => setResponseMode(value as ResponseMode)} disabled={isLoading}>
+                  <SelectTrigger id="source-context" className="w-44" aria-label="Answer depth">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="concise">Concise</SelectItem>
+                    <SelectItem value="balanced">Balanced</SelectItem>
+                    <SelectItem value="detailed">Detailed</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
               <form
                 onSubmit={(event) => {
                   event.preventDefault();
