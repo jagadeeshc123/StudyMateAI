@@ -2,17 +2,97 @@ import { extractText, getDocumentProxy } from "npm:unpdf@1.8.0";
 import { corsHeaders, jsonResponse } from "../_shared/cors.ts";
 import { HttpError, requireAuthenticatedUser } from "../_shared/auth.ts";
 import { createSupabaseAdminClient } from "../_shared/supabase-admin.ts";
+import {
+  DEFAULT_GEMINI_EMBEDDING_MODEL,
+  stableContentHash,
+} from "../_shared/gemini-embeddings.ts";
 import { chunkExtractedPages } from "../_shared/text.ts";
+import {
+  type DocumentEmbeddingResult,
+  embedDocumentChunks,
+} from "./document-embeddings.ts";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INSERT_BATCH_SIZE = 250;
 
 interface ProcessDocumentBody {
   documentId?: unknown;
+  action?: unknown;
 }
 
 function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "Unknown document-processing error.";
+  return error instanceof Error
+    ? error.message
+    : "Unknown document-processing error.";
+}
+
+async function attemptDocumentEmbeddings(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  documentId: string,
+  documentTitle: string | null,
+): Promise<DocumentEmbeddingResult> {
+  const apiKey = Deno.env.get("GEMINI_API_KEY");
+
+  const recordFailure = async (errorMessage: string) => {
+    const { error } = await supabase
+      .from("document_chunks")
+      .update({
+        embedding: null,
+        embedding_status: "failed",
+        embedding_error: errorMessage,
+        embedding_model: Deno.env.get("GEMINI_EMBEDDING_MODEL") ||
+          DEFAULT_GEMINI_EMBEDDING_MODEL,
+        embedded_at: null,
+      })
+      .eq("document_id", documentId)
+      .in("embedding_status", ["pending", "failed", "skipped"]);
+
+    if (error) {
+      console.error("Could not record document embedding failure", {
+        documentId,
+        error: error.message,
+      });
+    }
+  };
+
+  if (!apiKey) {
+    const errorMessage =
+      "The server is missing GEMINI_API_KEY. Keyword search remains available.";
+    await recordFailure(errorMessage);
+    return {
+      status: "failed",
+      totalChunks: 0,
+      embeddedChunks: 0,
+      skippedChunks: 0,
+      failedChunks: 0,
+      error: errorMessage,
+    };
+  }
+
+  try {
+    return await embedDocumentChunks(
+      supabase,
+      documentId,
+      apiKey,
+      documentTitle,
+    );
+  } catch (error) {
+    const errorMessage = getErrorMessage(error);
+    console.error("document embeddings unavailable", {
+      documentId,
+      error: errorMessage,
+    });
+    await recordFailure(errorMessage);
+    return {
+      status: "failed",
+      totalChunks: 0,
+      embeddedChunks: 0,
+      skippedChunks: 0,
+      failedChunks: 0,
+      error: errorMessage,
+    };
+  }
 }
 
 Deno.serve(async (request) => {
@@ -29,9 +109,14 @@ Deno.serve(async (request) => {
   let documentExists = false;
 
   try {
-    const { user, supabase: callerSupabase } = await requireAuthenticatedUser(request);
+    const { user, supabase: callerSupabase } = await requireAuthenticatedUser(
+      request,
+    );
     const body = (await request.json()) as ProcessDocumentBody;
     documentId = typeof body.documentId === "string" ? body.documentId : null;
+    const action = body.action === "backfill_embeddings"
+      ? "backfill_embeddings"
+      : "process";
 
     if (!documentId || !UUID_PATTERN.test(documentId)) {
       return jsonResponse({ error: "A valid document ID is required." }, 400);
@@ -39,39 +124,75 @@ Deno.serve(async (request) => {
 
     const { data: document, error: documentError } = await callerSupabase
       .from("documents")
-      .select("id, user_id, storage_path, mime_type, processing_status")
+      .select(
+        "id, user_id, storage_path, mime_type, processing_status, display_name, original_file_name",
+      )
       .eq("id", documentId)
       .eq("user_id", user.id)
       .maybeSingle();
 
     if (documentError) {
-      throw new Error(`Could not load the document record: ${documentError.message}`);
+      throw new Error(
+        `Could not load the document record: ${documentError.message}`,
+      );
     }
 
     if (!document || document.user_id !== user.id) {
       const ownershipLookup = createSupabaseAdminClient();
-      const { data: existingDocument, error: lookupError } = await ownershipLookup
-        .from("documents")
-        .select("id")
-        .eq("id", documentId)
-        .maybeSingle();
+      const { data: existingDocument, error: lookupError } =
+        await ownershipLookup
+          .from("documents")
+          .select("id")
+          .eq("id", documentId)
+          .maybeSingle();
 
       if (lookupError) {
-        throw new Error(`Could not verify document ownership: ${lookupError.message}`);
+        throw new Error(
+          `Could not verify document ownership: ${lookupError.message}`,
+        );
       }
 
       return existingDocument
-        ? jsonResponse({ error: "You do not have access to this document." }, 403)
+        ? jsonResponse(
+          { error: "You do not have access to this document." },
+          403,
+        )
         : jsonResponse({ error: "Document not found." }, 404);
     }
 
     documentExists = true;
+    const documentTitle = document.display_name?.trim() ||
+      document.original_file_name?.trim() || null;
+
+    if (action === "backfill_embeddings") {
+      if (document.processing_status !== "ready") {
+        return jsonResponse({
+          error:
+            "Embeddings can only be created after PDF text extraction is ready.",
+        }, 409);
+      }
+
+      supabase = createSupabaseAdminClient();
+      const embedding = await attemptDocumentEmbeddings(
+        supabase,
+        documentId,
+        documentTitle,
+      );
+      return jsonResponse({
+        documentId,
+        status: "ready",
+        embedding,
+      });
+    }
 
     if (document.mime_type !== "application/pdf") {
       throw new Error("The stored document is not a PDF.");
     }
 
-    if (document.processing_status !== "uploaded" && document.processing_status !== "failed") {
+    if (
+      document.processing_status !== "uploaded" &&
+      document.processing_status !== "failed"
+    ) {
       return jsonResponse({
         error: document.processing_status === "processing"
           ? "This document is already processing."
@@ -80,25 +201,30 @@ Deno.serve(async (request) => {
     }
 
     supabase = createSupabaseAdminClient();
-    const { data: claimedDocument, error: processingStatusError } = await supabase
-      .from("documents")
-      .update({
-        processing_status: "processing",
-        processing_error: null,
-        page_count: null,
-      })
-      .eq("id", documentId)
-      .eq("user_id", user.id)
-      .in("processing_status", ["uploaded", "failed"])
-      .select("id")
-      .maybeSingle();
+    const { data: claimedDocument, error: processingStatusError } =
+      await supabase
+        .from("documents")
+        .update({
+          processing_status: "processing",
+          processing_error: null,
+          page_count: null,
+        })
+        .eq("id", documentId)
+        .eq("user_id", user.id)
+        .in("processing_status", ["uploaded", "failed"])
+        .select("id")
+        .maybeSingle();
 
     if (processingStatusError) {
-      throw new Error(`Could not mark the document as processing: ${processingStatusError.message}`);
+      throw new Error(
+        `Could not mark the document as processing: ${processingStatusError.message}`,
+      );
     }
 
     if (!claimedDocument) {
-      return jsonResponse({ error: "This document is already processing or is no longer retryable." }, 409);
+      return jsonResponse({
+        error: "This document is already processing or is no longer retryable.",
+      }, 409);
     }
 
     const { error: clearChunksError } = await supabase
@@ -107,7 +233,9 @@ Deno.serve(async (request) => {
       .eq("document_id", documentId);
 
     if (clearChunksError) {
-      throw new Error(`Could not clear previous document chunks: ${clearChunksError.message}`);
+      throw new Error(
+        `Could not clear previous document chunks: ${clearChunksError.message}`,
+      );
     }
 
     const { data: pdfFile, error: downloadError } = await supabase.storage
@@ -115,28 +243,50 @@ Deno.serve(async (request) => {
       .download(document.storage_path);
 
     if (downloadError || !pdfFile) {
-      throw new Error(`Could not download the private PDF: ${downloadError?.message ?? "No file was returned."}`);
+      throw new Error(
+        `Could not download the private PDF: ${
+          downloadError?.message ?? "No file was returned."
+        }`,
+      );
     }
 
     const pdfBytes = new Uint8Array(await pdfFile.arrayBuffer());
     const pdf = await getDocumentProxy(pdfBytes);
     const extracted = await extractText(pdf, { mergePages: false });
-    const pages = Array.isArray(extracted.text) ? extracted.text : [extracted.text];
+    const pages = Array.isArray(extracted.text)
+      ? extracted.text
+      : [extracted.text];
     const chunks = chunkExtractedPages(pages);
 
     if (chunks.length === 0) {
-      throw new Error("No searchable text was found in this PDF. Scanned/image-only PDFs need OCR, which is not part of this MVP.");
+      throw new Error(
+        "No searchable text was found in this PDF. Scanned/image-only PDFs need OCR, which is not part of this MVP.",
+      );
     }
 
-    for (let offset = 0; offset < chunks.length; offset += INSERT_BATCH_SIZE) {
-      const batch = chunks.slice(offset, offset + INSERT_BATCH_SIZE).map((chunk) => ({
-        ...chunk,
-        document_id: documentId,
-      }));
-      const { error: insertError } = await supabase.from("document_chunks").insert(batch);
+    const chunksWithHashes = await Promise.all(chunks.map(async (chunk) => ({
+      ...chunk,
+      content_hash: await stableContentHash(chunk.content),
+      embedding_status: "pending",
+    })));
+
+    for (
+      let offset = 0;
+      offset < chunksWithHashes.length;
+      offset += INSERT_BATCH_SIZE
+    ) {
+      const batch = chunksWithHashes.slice(offset, offset + INSERT_BATCH_SIZE)
+        .map((chunk) => ({
+          ...chunk,
+          document_id: documentId,
+        }));
+      const { error: insertError } = await supabase.from("document_chunks")
+        .insert(batch);
 
       if (insertError) {
-        throw new Error(`Could not save extracted text: ${insertError.message}`);
+        throw new Error(
+          `Could not save extracted text: ${insertError.message}`,
+        );
       }
     }
 
@@ -154,18 +304,29 @@ Deno.serve(async (request) => {
       .maybeSingle();
 
     if (readyStatusError) {
-      throw new Error(`The text was extracted, but the ready status could not be saved: ${readyStatusError.message}`);
+      throw new Error(
+        `The text was extracted, but the ready status could not be saved: ${readyStatusError.message}`,
+      );
     }
 
     if (!readyDocument) {
       throw new Error("The document changed or was deleted while processing.");
     }
 
+    // Extraction readiness is independent from semantic-search readiness.
+    // Every embedding failure is contained so keyword Q&A remains available.
+    const embedding = await attemptDocumentEmbeddings(
+      supabase,
+      documentId,
+      documentTitle,
+    );
+
     return jsonResponse({
       documentId,
       status: "ready",
       pageCount: extracted.totalPages,
       chunkCount: chunks.length,
+      embedding,
     });
   } catch (error) {
     if (error instanceof HttpError) {
@@ -173,7 +334,10 @@ Deno.serve(async (request) => {
     }
 
     const errorMessage = getErrorMessage(error);
-    console.error("process-document failed", { documentId, error: errorMessage });
+    console.error("process-document failed", {
+      documentId,
+      error: errorMessage,
+    });
 
     if (supabase && documentId && documentExists) {
       const { error: failedStatusError } = await supabase
@@ -187,7 +351,10 @@ Deno.serve(async (request) => {
         .eq("processing_status", "processing");
 
       if (failedStatusError) {
-        console.error("Could not mark document as failed", failedStatusError.message);
+        console.error(
+          "Could not mark document as failed",
+          failedStatusError.message,
+        );
       }
     }
 

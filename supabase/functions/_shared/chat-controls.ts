@@ -16,23 +16,26 @@ export const RESPONSE_MODES: Record<ResponseMode, ResponseModeConfig> = {
     presentation: "Give a direct answer with minimal explanation.",
     citationTarget: "Use 2-3 important citations when available.",
     maxSources: 3,
-    maxOutputTokens: 300,
+    maxOutputTokens: 2_048,
   },
   balanced: {
     minimumWords: 250,
     maximumWords: 400,
     presentation: "Give a clear explanation with key supporting details.",
-    citationTarget: "Use 3-6 citations across the supporting material when available.",
+    citationTarget:
+      "Use 3-6 citations across the supporting material when available.",
     maxSources: 6,
-    maxOutputTokens: 700,
+    maxOutputTokens: 4_096,
   },
   detailed: {
     minimumWords: 500,
     maximumWords: 800,
-    presentation: "Use a structured explanation covering definitions, relationships, supporting details, and limitations present in the document.",
-    citationTarget: "Use 5-10 citations across relevant sections when available.",
-    maxSources: 10,
-    maxOutputTokens: 1_300,
+    presentation:
+      "Use a structured explanation covering definitions, relationships, supporting details, and limitations present in the document.",
+    citationTarget:
+      "Use 5-8 citations across relevant sections when available.",
+    maxSources: 8,
+    maxOutputTokens: 8_192,
   },
 };
 
@@ -47,13 +50,13 @@ export function responseModeInstruction(mode: ResponseMode): string {
   return [
     `Target ${config.minimumWords}-${config.maximumWords} words and do not exceed ${config.maximumWords} words.`,
     config.presentation,
-    config.citationTarget,
     "Do not pad the answer when the document lacks enough support.",
   ].join(" ");
 }
 
 export function isCompleteDocumentIntent(question: string): boolean {
-  const normalized = question.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+  const normalized = question.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ").trim();
   return [
     /\bsummari[sz]e (?:the )?(?:complete|entire|whole|full) (?:pdf|document)\b/,
     /\bsummari[sz]e (?:all|every) sections?\b/,

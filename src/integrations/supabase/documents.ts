@@ -16,8 +16,16 @@ export type DocumentSummary = ManagedDocument;
 export interface ProcessDocumentResult {
   documentId: string;
   status: "ready";
-  pageCount: number;
-  chunkCount: number;
+  pageCount?: number;
+  chunkCount?: number;
+  embedding: {
+    status: "ready" | "failed" | "skipped";
+    totalChunks: number;
+    embeddedChunks: number;
+    skippedChunks: number;
+    failedChunks: number;
+    error: string | null;
+  };
 }
 
 export interface DeleteDocumentResult {
@@ -197,4 +205,13 @@ export async function deleteDocument(documentId: string): Promise<DeleteDocument
 
 export async function processDocument(documentId: string): Promise<ProcessDocumentResult> {
   return invokeEdgeFunction<ProcessDocumentResult>("process-document", { documentId });
+}
+
+export async function backfillDocumentEmbeddings(
+  documentId: string,
+): Promise<ProcessDocumentResult> {
+  return invokeEdgeFunction<ProcessDocumentResult>("process-document", {
+    action: "backfill_embeddings",
+    documentId,
+  });
 }

@@ -1,0 +1,139 @@
+import type { ResponseMode } from "../_shared/chat-controls.ts";
+
+export interface SourceChunk {
+  id: string;
+  content: string;
+  page_number: number;
+}
+
+export interface SourceCitation {
+  chunkId: string;
+  pageNumber: number;
+  excerpt: string;
+  fullExcerpt: string;
+}
+
+export function buildPlainChunkContext(chunks: SourceChunk[]): string {
+  return chunks.map((chunk, index) =>
+    `[DOCUMENT CHUNK ${index + 1}]\n${chunk.content}`
+  ).join("\n\n---\n\n");
+}
+
+export function buildPlainSectionContext(sections: string[]): string {
+  return sections.map((section, index) =>
+    `[DOCUMENT SECTION ${index + 1}]\n${section}`
+  ).join("\n\n---\n\n");
+}
+
+function uniquePageChunks(chunks: SourceChunk[]): SourceChunk[] {
+  const seenPages = new Set<number>();
+  return chunks.filter((chunk) => {
+    if (seenPages.has(chunk.page_number)) return false;
+    seenPages.add(chunk.page_number);
+    return true;
+  });
+}
+
+export function selectStrongestCitationIds(
+  chunks: SourceChunk[],
+  mode: ResponseMode,
+): string[] {
+  const minimum = mode === "concise" ? 2 : mode === "balanced" ? 3 : 5;
+  const limit = mode === "concise" ? 3 : mode === "balanced" ? 6 : 8;
+  const selected = uniquePageChunks(chunks).slice(0, limit);
+  const selectedIds = new Set(selected.map((chunk) => chunk.id));
+
+  if (selected.length < minimum) {
+    for (const chunk of chunks) {
+      if (selectedIds.has(chunk.id)) continue;
+      selected.push(chunk);
+      selectedIds.add(chunk.id);
+      if (selected.length === Math.min(minimum, chunks.length)) break;
+    }
+  }
+
+  return selected.map((chunk) => chunk.id);
+}
+
+export function selectRepresentativeCitationIds(
+  chunks: SourceChunk[],
+  mode: ResponseMode,
+): string[] {
+  const candidates = uniquePageChunks(chunks);
+  const limit = mode === "concise" ? 3 : mode === "balanced" ? 6 : 8;
+  const count = Math.min(limit, candidates.length);
+
+  if (count === 0) return [];
+  if (count === 1) return [candidates[0].id];
+
+  const selected = new Set<number>();
+  for (let index = 0; index < count; index += 1) {
+    selected.add(Math.round(index * (candidates.length - 1) / (count - 1)));
+  }
+
+  return [...selected].map((index) => candidates[index].id);
+}
+
+function makeExcerpt(
+  content: string,
+  question: string,
+): { excerpt: string; fullExcerpt: string } {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  const keywords = question
+    .toLowerCase()
+    .match(/[a-z0-9]{4,}/g)
+    ?.filter((word) =>
+      ![
+        "what",
+        "when",
+        "where",
+        "which",
+        "with",
+        "from",
+        "that",
+        "this",
+        "does",
+        "about",
+      ].includes(word)
+    ) ?? [];
+  const lowerContent = normalized.toLowerCase();
+  const matchPosition = keywords
+    .map((keyword) => lowerContent.indexOf(keyword))
+    .find((position) => position >= 0) ?? 0;
+  const start = Math.max(0, matchPosition - 80);
+  const end = Math.min(normalized.length, start + 280);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < normalized.length ? "…" : "";
+
+  return {
+    excerpt: `${prefix}${normalized.slice(start, end).trim()}${suffix}`,
+    fullExcerpt: normalized,
+  };
+}
+
+export function citationsFromIds(
+  citedChunkIds: string[],
+  chunks: SourceChunk[],
+  question: string,
+  maxSources: number,
+): SourceCitation[] {
+  const chunksById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+  const citations: SourceCitation[] = [];
+
+  for (const id of citedChunkIds) {
+    const chunk = chunksById.get(id);
+
+    if (!chunk) continue;
+
+    const excerpts = makeExcerpt(chunk.content, question);
+    citations.push({
+      chunkId: chunk.id,
+      pageNumber: chunk.page_number,
+      ...excerpts,
+    });
+
+    if (citations.length === maxSources) break;
+  }
+
+  return citations;
+}

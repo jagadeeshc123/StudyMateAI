@@ -5,7 +5,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(24);
+select plan(26);
 
 create temporary table phase1_test_context on commit drop as
 with generated as (
@@ -77,10 +77,12 @@ select
   page_b_number
 from phase1_test_context;
 
-insert into public.document_chunks (document_id, content, page_number, chunk_index)
-select document_a_id, content_a, page_a_number, 0 from phase1_test_context
+insert into public.document_chunks (
+  document_id, content, page_number, chunk_index, content_hash
+)
+select document_a_id, content_a, page_a_number, 0, md5(content_a) from phase1_test_context
 union all
-select document_b_id, content_b, page_b_number, 0 from phase1_test_context;
+select document_b_id, content_b, page_b_number, 0, md5(content_b) from phase1_test_context;
 
 insert into public.messages (document_id, role, content)
 select document_a_id, 'user', format('question-%s', document_a_id) from phase1_test_context
@@ -124,6 +126,24 @@ select is(
 );
 select is((select count(*) from public.list_documents()), 1::bigint, 'list_documents is caller-scoped');
 select is((select count(*) from public.list_user_documents()), 1::bigint, 'list_user_documents is caller-scoped');
+
+select ok(
+  not has_function_privilege(
+    'authenticated',
+    'public.hybrid_search_document_chunks(uuid,extensions.vector,text,integer[],integer,real,real,text)',
+    'EXECUTE'
+  ),
+  'Browser roles cannot execute the privileged hybrid-search function'
+);
+
+select ok(
+  has_function_privilege(
+    'service_role',
+    'public.hybrid_search_document_chunks(uuid,extensions.vector,text,integer[],integer,real,real,text)',
+    'EXECUTE'
+  ),
+  'The secure server role can execute hybrid search after owner verification'
+);
 
 select is(
   (

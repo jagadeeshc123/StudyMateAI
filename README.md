@@ -24,7 +24,7 @@ Only use the browser-safe publishable/anonymous key. Never put a Supabase servic
 
 ## Database and private Storage setup
 
-The version-controlled migrations create the private `documents` bucket, the application tables, authenticated ownership policies, and the server-only text-search function.
+The version-controlled migrations create the private `documents` bucket, the application tables, authenticated ownership policies, pgvector embedding storage, and server-only keyword/hybrid search functions.
 
 Link the Supabase CLI and apply all migrations:
 
@@ -40,6 +40,7 @@ Alternatively, run these files in timestamp order using **Supabase Dashboard -> 
 3. `supabase/migrations/20260727023000_add_authentication_and_ownership.sql`
 4. `supabase/migrations/20260727130000_phase1_document_management.sql`
 5. `supabase/migrations/20260727160000_phase1_security_hardening.sql`
+6. `supabase/migrations/20260729120000_phase2_pgvector_hybrid_search.sql`
 
 In **Supabase Dashboard -> Storage**, confirm the `documents` bucket exists and **Public bucket** is disabled. The first migration creates and configures it automatically when run as written.
 
@@ -51,11 +52,14 @@ Email/password authentication is enabled by default in Supabase. In **Authentica
 
 ## Server-only AI secrets
 
-The chat Edge Function uses the Gemini Interactions API. `gemini-3-flash-preview` is the default because it supports structured output and currently has a Gemini API free tier. Set secrets in Supabase, not in frontend code:
+The chat Edge Function uses the Gemini generateContent API. `gemini-3.1-flash-lite` is the default. Set secrets in Supabase, not in frontend code:
 
 ```sh
-npx supabase secrets set GEMINI_API_KEY="your-real-key" GEMINI_MODEL="gemini-3-flash-preview" --project-ref "$PROJECT_REF"
+npx supabase secrets set GEMINI_API_KEY="your-real-key" GEMINI_MODEL="gemini-3.1-flash-lite" --project-ref "$PROJECT_REF"
+npx supabase secrets set GEMINI_EMBEDDING_MODEL="gemini-embedding-2" GEMINI_EMBEDDING_DIMENSIONS="768" --project-ref "$PROJECT_REF"
 ```
+
+StudyMate uses synchronous `gemini-embedding-2:embedContent` requests through the Gemini API Free Tier and has no paid or asynchronous Batch API fallback. It formats questions and document chunks with the model's asymmetric question-answering prefixes and requests 768 dimensions. If embedding quota or availability prevents semantic indexing, extracted documents remain ready and chat automatically uses PostgreSQL keyword retrieval. The Gemini key remains server-only and must never use a `VITE_*` name.
 
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided automatically inside hosted Supabase Edge Functions. The service-role key must never be copied into `.env` or a browser file.
 
@@ -95,6 +99,7 @@ deno check --config supabase/functions/deno.json supabase/functions/process-docu
 npm run build
 npm run lint
 npx supabase test db supabase/tests/ownership_rls.sql
+npx supabase test db supabase/tests/phase2_hybrid_search.sql
 ```
 
 The SQL test checks cross-user RLS for documents, chunks, messages, document statistics, rename behavior, display-name validation, and history clearing against a local Supabase database. Also perform the two-account browser test after deploying the migration and functions.
@@ -104,16 +109,16 @@ The SQL test checks cross-user RLS for documents, chunks, messages, document sta
 1. Supabase restores the persisted session; `/upload`, `/documents`, `/chat`, and `/history` redirect to `/login` if no authenticated user exists.
 2. The browser validates and uploads a PDF under `<auth.uid()>/<document-id>.pdf`, then inserts metadata with the authenticated user's ID.
 3. The browser invokes `process-document` with the access token and waits before opening Chat.
-4. The Edge Function authenticates the caller, verifies ownership, downloads the private PDF, extracts per-page text, stores chunks, and marks the document `ready` or `failed`.
-5. Documents lists owner-scoped status, errors, and statistics in one request. Rename changes only the display name; deletion runs through the authenticated `delete-document` function.
+4. The Edge Function authenticates the caller, verifies ownership, downloads the private PDF, extracts per-page text, stores chunks, and marks extraction `ready` before attempting free-tier semantic indexing. Embedding failures never disable keyword chat.
+5. Documents lists owner-scoped extraction and semantic-search status, errors, and statistics in one request. Owners can retry semantic backfill for one ready document; rename changes only the display name, and deletion runs through the authenticated `delete-document` function.
 6. History groups saved Q&A by owned document and uses an authenticated owner-scoped SQL function for clearing one document or all history without deleting PDFs.
 7. Chat intersects the current user's ready documents with the user-scoped latest-upload batch, persists that batch across refresh, and replaces it when **Open in Chat** is used from Documents or History.
-8. The answer-depth selector sends a server-clamped `concise`, `balanced`, or `detailed` mode. Ordinary questions use bounded retrieval; complete-document intents use ordered all-chunk or hierarchical summarization. Citations are validated against stored chunks and provide expandable database excerpts.
+8. The answer-depth selector sends a server-clamped `concise`, `balanced`, or `detailed` mode. Ordinary and page-specific questions use bounded pgvector/full-text reciprocal-rank fusion with automatic keyword fallback; complete-document intents keep ordered all-chunk or hierarchical summarization. Citations remain derived from retrieved database chunks and provide expandable database excerpts.
 
 ## MVP limitations
 
 - Image-only/scanned PDFs are rejected because OCR is not implemented.
-- Retrieval is keyword/full-text ranking, not semantic vector search.
+- Semantic retrieval depends on Gemini Free Tier embedding availability; keyword retrieval remains available when embeddings are pending or failed.
 - One selected document is queried at a time.
 - There is no password-reset UI, rate limiting, browser E2E test suite, or background job queue.
 - PDF processing runs synchronously within Edge Function runtime limits; very complex 20 MB PDFs may need a queued worker later.

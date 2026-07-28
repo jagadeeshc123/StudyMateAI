@@ -68,24 +68,42 @@ export type Database = {
         Row: {
           chunk_index: number
           content: string
+          content_hash: string
           created_at: string
           document_id: string
+          embedded_at: string | null
+          embedding: string | null
+          embedding_error: string | null
+          embedding_model: string | null
+          embedding_status: string
           id: string
           page_number: number
         }
         Insert: {
           chunk_index: number
           content: string
+          content_hash: string
           created_at?: string
           document_id: string
+          embedded_at?: string | null
+          embedding?: string | null
+          embedding_error?: string | null
+          embedding_model?: string | null
+          embedding_status?: string
           id?: string
           page_number: number
         }
         Update: {
           chunk_index?: number
           content?: string
+          content_hash?: string
           created_at?: string
           document_id?: string
+          embedded_at?: string | null
+          embedding?: string | null
+          embedding_error?: string | null
+          embedding_model?: string | null
+          embedding_status?: string
           id?: string
           page_number?: number
         }
@@ -148,6 +166,10 @@ export type Database = {
           chunk_count: number
           created_at: string
           display_name: string | null
+          embedded_chunk_count: number
+          embedding_error: string | null
+          embedding_model: string | null
+          embedding_status: string
           file_size: number
           id: string
           message_count: number
@@ -181,6 +203,28 @@ export type Database = {
           id: string
           page_number: number
           rank: number
+        }[]
+      }
+      hybrid_search_document_chunks: {
+        Args: {
+          keyword_query: string
+          keyword_weight?: number
+          match_count?: number
+          query_embedding: string
+            requested_page_numbers?: number[] | null
+            semantic_weight?: number
+            target_embedding_model?: string
+            target_document_id: string
+        }
+        Returns: {
+          chunk_index: number
+          combined_score: number
+          content: string
+          document_id: string
+          id: string
+          keyword_score: number | null
+          page_number: number
+          semantic_score: number | null
         }[]
       }
     }

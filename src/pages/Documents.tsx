@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { FileText, MessageSquare, Pencil, RefreshCw, Trash2 } from "lucide-react";
+import { FileText, MessageSquare, Pencil, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 import { setActiveBatch } from "@/integrations/supabase/active-batch";
@@ -29,6 +29,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  backfillDocumentEmbeddings,
   deleteDocument,
   listManagedDocuments,
   processDocument,
@@ -56,6 +57,7 @@ const Documents = () => {
   const [deleteTarget, setDeleteTarget] = useState<ManagedDocument | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [embeddingId, setEmbeddingId] = useState<string | null>(null);
   const [visibleErrorId, setVisibleErrorId] = useState<string | null>(null);
   const navigate = useNavigate();
   const { user } = useAuth();
@@ -161,6 +163,36 @@ const Documents = () => {
     }
   };
 
+  const backfillEmbeddings = async (document: ManagedDocument) => {
+    if (embeddingId || document.processing_status !== "ready") return;
+
+    setEmbeddingId(document.id);
+    try {
+      const result = await backfillDocumentEmbeddings(document.id);
+      if (result.embedding.status === "failed") {
+        toast.error(
+          result.embedding.error ??
+            "Semantic indexing could not finish. Keyword search is still available.",
+        );
+      } else {
+        toast.success(
+          result.embedding.status === "skipped"
+            ? "Semantic index is already up to date."
+            : "Semantic indexing completed.",
+        );
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Semantic indexing failed. Keyword search is still available.",
+      );
+    } finally {
+      setEmbeddingId(null);
+      await refreshDocuments();
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-background to-muted/30">
       <Navbar />
@@ -192,7 +224,8 @@ const Documents = () => {
               {documents.map((document) => {
                 const status = document.id === deletingId ? "deleting" : document.processing_status;
                 const retryable = status === "failed" || status === "uploaded";
-                const operationBusy = document.id === deletingId || document.id === retryingId;
+                const operationBusy = document.id === deletingId ||
+                  document.id === retryingId || document.id === embeddingId;
 
                 return (
                   <Card key={document.id} className="border-2">
@@ -213,17 +246,29 @@ const Documents = () => {
                       </div>
                     </CardHeader>
                     <CardContent>
-                      <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-5">
+                      <dl className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-6">
                         <div><dt className="text-muted-foreground">File size</dt><dd className="font-medium">{formatFileSize(document.file_size)}</dd></div>
                         <div><dt className="text-muted-foreground">Uploaded</dt><dd className="font-medium">{new Date(document.created_at).toLocaleString()}</dd></div>
                         <div><dt className="text-muted-foreground">Pages</dt><dd className="font-medium">{document.page_count ?? "—"}</dd></div>
                         <div><dt className="text-muted-foreground">Chunks</dt><dd className="font-medium">{document.chunk_count}</dd></div>
                         <div><dt className="text-muted-foreground">Messages</dt><dd className="font-medium">{document.message_count}</dd></div>
+                        <div>
+                          <dt className="text-muted-foreground">Semantic search</dt>
+                          <dd className="font-medium capitalize">
+                            {document.embedding_status} ({document.embedded_chunk_count}/{document.chunk_count})
+                          </dd>
+                        </div>
                       </dl>
 
                       {visibleErrorId === document.id && document.processing_error && (
                         <p className="mt-4 rounded-md bg-destructive/10 p-3 text-sm text-destructive" role="alert">
                           {document.processing_error}
+                        </p>
+                      )}
+
+                      {visibleErrorId === document.id && document.embedding_error && (
+                        <p className="mt-4 rounded-md bg-muted p-3 text-sm text-muted-foreground" role="status">
+                          Semantic indexing: {document.embedding_error} Keyword search remains available.
                         </p>
                       )}
 
@@ -246,13 +291,28 @@ const Documents = () => {
                             {document.id === retryingId ? "Processing..." : "Retry Processing"}
                           </Button>
                         )}
-                        {document.processing_error && (
+                        {status === "ready" && document.embedding_status !== "ready" && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void backfillEmbeddings(document)}
+                            disabled={operationBusy}
+                          >
+                            <Sparkles className="mr-2 h-4 w-4" />
+                            {document.id === embeddingId
+                              ? "Indexing..."
+                              : document.embedding_status === "failed"
+                              ? "Retry Semantic Index"
+                              : "Enable Semantic Search"}
+                          </Button>
+                        )}
+                        {(document.processing_error || document.embedding_error) && (
                           <Button
                             size="sm"
                             variant="ghost"
                             onClick={() => setVisibleErrorId((current) => current === document.id ? null : document.id)}
                           >
-                            {visibleErrorId === document.id ? "Hide processing error" : "View processing error"}
+                            {visibleErrorId === document.id ? "Hide details" : "View details"}
                           </Button>
                         )}
                         <Button size="sm" variant="destructive" onClick={() => setDeleteTarget(document)} disabled={operationBusy}>
