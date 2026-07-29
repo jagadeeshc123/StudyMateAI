@@ -42,6 +42,12 @@ import {
   selectStrongestCitationIds,
   type SourceCitation,
 } from "./document-sources.ts";
+import {
+  createRequestId,
+  logOperational,
+  requestJsonResponse,
+  type SafeReasonCode,
+} from "../_shared/request-context.ts";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -124,7 +130,11 @@ function requiredServerSecret(name: string): string {
   const value = Deno.env.get(name);
 
   if (!value) {
-    throw new Error(`The server is missing the ${name} secret.`);
+    throw new HttpError(
+      503,
+      "The AI answer provider is not configured. Contact the application administrator.",
+      "provider_unavailable",
+    );
   }
 
   return value;
@@ -132,19 +142,47 @@ function requiredServerSecret(name: string): string {
 
 async function tryGenerateQueryEmbedding(
   question: string,
+  requestId: string,
 ): Promise<QueryEmbedding | null> {
   try {
     const apiKey = Deno.env.get("GEMINI_API_KEY");
     if (!apiKey) return null;
 
     const configuration = embeddingConfigurationFromEnvironment();
-    const [embedding] = await generateGeminiEmbeddings([
-      formatEmbeddingQuery(question),
-    ], {
-      apiKey,
-      model: configuration.model,
-      dimensions: configuration.dimensions,
-    });
+    const [embedding] = await generateGeminiEmbeddings(
+      [
+        formatEmbeddingQuery(question),
+      ],
+      {
+        apiKey,
+        model: configuration.model,
+        dimensions: configuration.dimensions,
+      },
+      fetch,
+      (level, diagnostic) =>
+        logOperational(level, {
+          requestId,
+          stage: "chat-document-query-embedding",
+          httpStatus: diagnostic.httpStatus ?? 0,
+          reasonCode: diagnostic.errorCode === "none"
+            ? "none"
+            : diagnostic.errorCode === "quota"
+            ? "provider_quota"
+            : diagnostic.errorCode === "authentication"
+            ? "provider_authentication"
+            : diagnostic.errorCode === "model_unavailable"
+            ? "provider_model_unavailable"
+            : diagnostic.errorCode === "dimension_mismatch"
+            ? "provider_invalid_dimension"
+            : diagnostic.errorCode === "timeout"
+            ? "provider_timeout"
+            : diagnostic.errorCode === "network_failure"
+            ? "provider_network_failure"
+            : "provider_unavailable",
+          model: diagnostic.model,
+          chunkCount: diagnostic.inputCount,
+        }),
+    );
     return {
       vector: embeddingToPostgres(embedding),
       model: configuration.model,
@@ -157,16 +195,18 @@ async function tryGenerateQueryEmbedding(
         return { model: "invalid", dimensions: 0 };
       }
     })();
-    console.warn(
-      "semantic query embedding unavailable; using keyword retrieval",
-      {
-        model: configuration.model,
-        dimensions: configuration.dimensions,
-        errorCode: error instanceof GeminiEmbeddingError
-          ? error.code
-          : "unknown",
-      },
-    );
+    logOperational("warn", {
+      requestId,
+      stage: "chat-document-keyword-fallback",
+      httpStatus: 200,
+      reasonCode:
+        error instanceof GeminiEmbeddingError && error.code === "quota"
+          ? "provider_quota"
+          : error instanceof GeminiEmbeddingError && error.code === "timeout"
+          ? "provider_timeout"
+          : "provider_unavailable",
+      model: configuration.model,
+    });
     return null;
   }
 }
@@ -177,6 +217,7 @@ async function runHybridRetrieval(
   question: string,
   queryEmbedding: QueryEmbedding,
   requestedPageNumbers: number[] | null,
+  requestId: string,
 ): Promise<HybridChunk[] | null> {
   const { data, error } = await supabase.rpc("hybrid_search_document_chunks", {
     target_document_id: documentId,
@@ -190,10 +231,11 @@ async function runHybridRetrieval(
   });
 
   if (error) {
-    console.warn("hybrid retrieval unavailable; using keyword retrieval", {
-      documentId,
-      requestedPageCount: requestedPageNumbers?.length ?? 0,
-      error: error.message,
+    logOperational("warn", {
+      requestId,
+      stage: "chat-document-hybrid-fallback",
+      httpStatus: 200,
+      reasonCode: "database_failure",
     });
     return null;
   }
@@ -207,9 +249,11 @@ async function generatePlainAnswer(
   input: string,
   maxOutputTokens: number,
   responseMode: ResponseMode,
+  requestId: string,
 ): Promise<string> {
   try {
     return await requestGeminiText({
+      requestId,
       model: Deno.env.get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
       apiKey: requiredServerSecret("GEMINI_API_KEY"),
       responseMode,
@@ -230,9 +274,11 @@ async function generateIntermediateSummary(
   input: string,
   maxOutputTokens: number,
   responseMode: ResponseMode,
+  requestId: string,
 ): Promise<string> {
   try {
     return await requestGeminiText({
+      requestId,
       model: Deno.env.get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
       apiKey: requiredServerSecret("GEMINI_API_KEY"),
       responseMode,
@@ -252,19 +298,27 @@ function throwGeminiHttpError(error: unknown): never {
 
   switch (error.code) {
     case "quota":
-      throw new HttpError(429, error.message);
+      throw new HttpError(429, error.message, "provider_quota");
     case "unavailable":
-      throw new HttpError(503, error.message);
+      throw new HttpError(503, error.message, "provider_unavailable");
+    case "model_unavailable":
+      throw new HttpError(502, error.message, "provider_model_unavailable");
+    case "timeout":
+      throw new HttpError(504, error.message, "provider_timeout");
     case "safety":
     case "recitation":
-      throw new HttpError(422, error.message);
+      throw new HttpError(422, error.message, "provider_blocked");
     case "output_limit":
+      throw new HttpError(502, error.message, "provider_output_limit");
     case "authentication":
+      throw new HttpError(502, error.message, "provider_authentication");
     case "empty_response":
+      throw new HttpError(502, error.message, "provider_empty_response");
     case "network_failure":
+      throw new HttpError(502, error.message, "provider_network_failure");
     case "invalid_request":
     case "provider_failure":
-      throw new HttpError(502, error.message);
+      throw new HttpError(502, error.message, "provider_unavailable");
   }
 }
 
@@ -355,6 +409,7 @@ async function summarizeCompleteDocument(
   documentId: string,
   question: string,
   mode: ResponseMode,
+  requestId: string,
 ): Promise<{ answer: string; chunks: RetrievedChunk[] }> {
   const chunks = await loadAllDocumentChunks(supabase, documentId);
   if (chunks.length === 0) return { answer: NOT_FOUND_ANSWER, chunks };
@@ -376,6 +431,7 @@ async function summarizeCompleteDocument(
       `Answer this whole-document request: ${question}`,
       RESPONSE_MODES[mode].maxOutputTokens,
       mode,
+      requestId,
     );
     return { answer, chunks };
   }
@@ -388,6 +444,7 @@ async function summarizeCompleteDocument(
       "Create a grounded intermediate summary for later whole-document synthesis.",
       INTERMEDIATE_SUMMARY_OUTPUT_TOKENS,
       mode,
+      requestId,
     );
     nodes.push({
       text: partial,
@@ -408,6 +465,7 @@ async function summarizeCompleteDocument(
         "Create a grounded higher-level summary for final synthesis.",
         REDUCTION_SUMMARY_OUTPUT_TOKENS,
         mode,
+        requestId,
       );
       reducedNodes.push({
         text: reduced,
@@ -424,6 +482,7 @@ async function summarizeCompleteDocument(
     `Answer this whole-document request: ${question}`,
     RESPONSE_MODES[mode].maxOutputTokens,
     mode,
+    requestId,
   );
 
   return { answer, chunks };
@@ -458,6 +517,25 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: "Only POST requests are supported." }, 405);
   }
 
+  const requestId = createRequestId();
+  const startedAt = Date.now();
+  const respond = (body: Record<string, unknown>, status = 200) =>
+    requestJsonResponse(requestId, body, status);
+  const fail = (
+    message: string,
+    status: number,
+    reasonCode: SafeReasonCode,
+  ) => {
+    logOperational(status >= 500 ? "error" : "warn", {
+      requestId,
+      stage: "chat-document",
+      httpStatus: status,
+      reasonCode,
+      durationMs: Date.now() - startedAt,
+    });
+    return respond({ error: message }, status);
+  };
+
   try {
     const { user, supabase: callerSupabase } = await requireAuthenticatedUser(
       request,
@@ -470,7 +548,7 @@ Deno.serve(async (request) => {
     const responseMode = normalizeResponseMode(body.response_mode);
 
     if (!UUID_PATTERN.test(documentId)) {
-      return jsonResponse({ error: "A valid document ID is required." }, 400);
+      return fail("A valid document ID is required.", 400, "invalid_request");
     }
 
     const { data: document, error: documentError } = await callerSupabase
@@ -481,35 +559,18 @@ Deno.serve(async (request) => {
       .maybeSingle();
 
     if (documentError) {
-      throw new Error(`Could not load the document: ${documentError.message}`);
+      return fail(
+        "The document could not be checked before chat.",
+        500,
+        "database_failure",
+      );
     }
 
     if (!document || document.user_id !== user.id) {
-      const ownershipLookup = createSupabaseAdminClient();
-      const { data: existingDocument, error: lookupError } =
-        await ownershipLookup
-          .from("documents")
-          .select("id")
-          .eq("id", documentId)
-          .maybeSingle();
-
-      if (lookupError) {
-        throw new Error(
-          `Could not verify document ownership: ${lookupError.message}`,
-        );
-      }
-
-      return existingDocument
-        ? jsonResponse(
-          { error: "You do not have access to this document." },
-          403,
-        )
-        : jsonResponse({ error: "Document not found." }, 404);
+      return fail("Document not found or unavailable.", 404, "not_found");
     }
 
     const supabase = createSupabaseAdminClient();
-    console.info("chat-document selected document", { documentId });
-
     if (body.action === "history") {
       const { data: messages, error: messagesError } = await supabase
         .from("messages")
@@ -524,30 +585,30 @@ Deno.serve(async (request) => {
         );
       }
 
-      return jsonResponse({ messages });
+      return respond({ messages });
     }
 
     if (
       document.processing_status === "processing" ||
       document.processing_status === "uploaded"
     ) {
-      return jsonResponse({
-        error:
-          "This document is still processing. Please wait until it is ready.",
-      }, 409);
+      return fail(
+        "This document is still processing. Please wait until it is ready.",
+        409,
+        "conflict",
+      );
     }
 
     if (document.processing_status === "failed") {
-      return jsonResponse({
-        error:
-          "PDF text extraction failed for this document. Upload a searchable PDF and try again.",
-      }, 422);
+      return fail(
+        "PDF text extraction failed for this document. Upload a searchable PDF and try again.",
+        422,
+        "invalid_request",
+      );
     }
 
     if (document.processing_status !== "ready") {
-      return jsonResponse({
-        error: "This document is not ready for questions.",
-      }, 409);
+      return fail("This document is not ready for questions.", 409, "conflict");
     }
 
     const question = typeof body.question === "string"
@@ -555,13 +616,15 @@ Deno.serve(async (request) => {
       : "";
 
     if (!question) {
-      return jsonResponse({ error: "Enter a question before sending." }, 400);
+      return fail("Enter a question before sending.", 400, "invalid_request");
     }
 
     if (question.length > MAX_QUESTION_LENGTH) {
-      return jsonResponse({
-        error: `Questions must be ${MAX_QUESTION_LENGTH} characters or fewer.`,
-      }, 400);
+      return fail(
+        `Questions must be ${MAX_QUESTION_LENGTH} characters or fewer.`,
+        400,
+        "invalid_request",
+      );
     }
 
     let requestedPageNumbers: number[];
@@ -570,16 +633,11 @@ Deno.serve(async (request) => {
       requestedPageNumbers = parseRequestedPageNumbers(question);
     } catch (error) {
       if (error instanceof PageReferenceError) {
-        return jsonResponse({ error: error.message }, 400);
+        return fail(error.message, 400, "invalid_request");
       }
 
       throw error;
     }
-
-    console.info("chat-document parsed page numbers", {
-      documentId,
-      requestedPageNumbers,
-    });
 
     if (
       requestedPageNumbers.length === 0 && isCompleteDocumentIntent(question)
@@ -589,6 +647,7 @@ Deno.serve(async (request) => {
         documentId,
         question,
         responseMode,
+        requestId,
       );
       const sources = citationsFromIds(
         selectRepresentativeCitationIds(summary.chunks, responseMode),
@@ -608,7 +667,7 @@ Deno.serve(async (request) => {
         answer,
         safeSources,
       );
-      return jsonResponse({
+      return respond({
         answer,
         sources: safeSources,
         notFound: !answerFound,
@@ -640,14 +699,6 @@ Deno.serve(async (request) => {
       );
 
       if (missingRequestedPage) {
-        console.info("chat-document retrieved chunks", {
-          documentId,
-          retrievedChunkCount: 0,
-        });
-        console.info("chat-document validated citations", {
-          documentId,
-          validatedCitationCount: 0,
-        });
         await saveConversation(
           supabase,
           documentId,
@@ -655,14 +706,17 @@ Deno.serve(async (request) => {
           PAGE_NOT_FOUND_ANSWER,
           [],
         );
-        return jsonResponse({
+        return respond({
           answer: PAGE_NOT_FOUND_ANSWER,
           sources: [],
           notFound: true,
         });
       }
 
-      const queryEmbedding = await tryGenerateQueryEmbedding(question);
+      const queryEmbedding = await tryGenerateQueryEmbedding(
+        question,
+        requestId,
+      );
 
       const rankedPageChunks = rankChunksWithinPages(
         pageChunks ?? [],
@@ -677,6 +731,7 @@ Deno.serve(async (request) => {
           question,
           queryEmbedding,
           requestedPageNumbers,
+          requestId,
         )
         : null;
 
@@ -687,14 +742,6 @@ Deno.serve(async (request) => {
           rankedPageChunks.length === 0 &&
           extractSearchKeywords(question).length > 0
         ) {
-          console.info("chat-document retrieved chunks", {
-            documentId,
-            retrievedChunkCount: 0,
-          });
-          console.info("chat-document validated citations", {
-            documentId,
-            validatedCitationCount: 0,
-          });
           await saveConversation(
             supabase,
             documentId,
@@ -702,7 +749,7 @@ Deno.serve(async (request) => {
             PAGE_TOPIC_NOT_FOUND_ANSWER,
             [],
           );
-          return jsonResponse({
+          return respond({
             answer: PAGE_TOPIC_NOT_FOUND_ANSWER,
             sources: [],
             notFound: true,
@@ -718,7 +765,10 @@ Deno.serve(async (request) => {
           );
       }
     } else {
-      const queryEmbedding = await tryGenerateQueryEmbedding(question);
+      const queryEmbedding = await tryGenerateQueryEmbedding(
+        question,
+        requestId,
+      );
       const hybridChunks = queryEmbedding
         ? await runHybridRetrieval(
           supabase,
@@ -726,6 +776,7 @@ Deno.serve(async (request) => {
           question,
           queryEmbedding,
           null,
+          requestId,
         )
         : null;
 
@@ -756,22 +807,21 @@ Deno.serve(async (request) => {
 
     retrievedChunks = limitChunksByContextSize(retrievedChunks);
 
-    console.info("chat-document retrieved chunks", {
-      documentId,
-      retrievedChunkCount: retrievedChunks.length,
-      topK,
+    logOperational("info", {
+      requestId,
+      stage: "chat-document-retrieval",
+      httpStatus: 200,
+      reasonCode: "none",
+      chunkCount: retrievedChunks.length,
+      durationMs: Date.now() - startedAt,
     });
 
     if (retrievedChunks.length === 0) {
       const answer = requestedPageNumbers.length > 0
         ? PAGE_TOPIC_NOT_FOUND_ANSWER
         : NOT_FOUND_ANSWER;
-      console.info("chat-document validated citations", {
-        documentId,
-        validatedCitationCount: 0,
-      });
       await saveConversation(supabase, documentId, question, answer, []);
-      return jsonResponse({ answer, sources: [], notFound: true });
+      return respond({ answer, sources: [], notFound: true });
     }
 
     const unsupportedAnswer = requestedPageNumbers.length > 0
@@ -790,6 +840,7 @@ Deno.serve(async (request) => {
       `Based only on the context, answer this question: ${question}`,
       RESPONSE_MODES[responseMode].maxOutputTokens,
       responseMode,
+      requestId,
     );
 
     const sources = citationsFromIds(
@@ -798,9 +849,13 @@ Deno.serve(async (request) => {
       question,
       RESPONSE_MODES[responseMode].maxSources,
     );
-    console.info("chat-document validated citations", {
-      documentId,
-      validatedCitationCount: sources.length,
+    logOperational("info", {
+      requestId,
+      stage: "chat-document-citations",
+      httpStatus: 200,
+      reasonCode: "none",
+      chunkCount: sources.length,
+      durationMs: Date.now() - startedAt,
     });
     const answerText = generatedAnswer.trim();
     const answerFound = answerText !== unsupportedAnswer && sources.length > 0;
@@ -809,20 +864,20 @@ Deno.serve(async (request) => {
 
     await saveConversation(supabase, documentId, question, answer, safeSources);
 
-    return jsonResponse({
+    return respond({
       answer,
       sources: safeSources,
       notFound: !answerFound,
     });
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.message }, error.status);
+      return fail(error.message, error.status, error.reasonCode);
     }
 
-    const message = error instanceof Error
-      ? error.message
-      : "Unexpected chat error.";
-    console.error("chat-document failed", message);
-    return jsonResponse({ error: message }, 500);
+    return fail(
+      "The chat request failed unexpectedly. Please retry.",
+      500,
+      "internal_failure",
+    );
   }
 });

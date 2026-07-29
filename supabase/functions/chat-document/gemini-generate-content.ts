@@ -4,6 +4,7 @@ export const DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite";
 export const INTERMEDIATE_SUMMARY_OUTPUT_TOKENS = 2_048;
 export const REDUCTION_SUMMARY_OUTPUT_TOKENS = 4_096;
 export const MAX_RETRY_OUTPUT_TOKENS = 16_384;
+export const GEMINI_ANSWER_TIMEOUT_MS = 45_000;
 
 const GEMINI_API_ROOT =
   "https://generativelanguage.googleapis.com/v1beta/models";
@@ -18,7 +19,9 @@ export type GeminiProviderErrorCode =
   | "unavailable"
   | "safety"
   | "recitation"
-  | "provider_failure";
+  | "provider_failure"
+  | "model_unavailable"
+  | "timeout";
 
 export class GeminiProviderError extends Error {
   constructor(
@@ -31,6 +34,8 @@ export class GeminiProviderError extends Error {
 }
 
 export interface GeminiTextRequestOptions {
+  requestId: string;
+  timeoutMs?: number;
   model: string;
   apiKey: string;
   responseMode: ResponseMode;
@@ -47,14 +52,13 @@ export interface GeminiGenerateContentResult {
 }
 
 export interface GeminiSafeDiagnostics {
+  requestId: string;
+  stage: "intermediate" | "final";
   httpStatus: number | null;
-  googleErrorStatus: string | null;
-  googleErrorMessage: string | null;
-  promptFeedbackBlockReason: string | null;
-  promptFeedbackBlockReasonMessage: string | null;
   model: string;
   outputBudget: number;
   finishReason: string | null;
+  reasonCode: GeminiProviderErrorCode | "none";
 }
 
 export type GeminiFetch = (
@@ -187,30 +191,11 @@ export function extractGeminiGenerateContentText(
   return { text, finishReason };
 }
 
-function sanitizedGoogleMessage(value: unknown, apiKey: string): string | null {
-  if (typeof value !== "string") return null;
-
-  const withoutKey = apiKey ? value.split(apiKey).join("[REDACTED]") : value;
-  const sanitized = withoutKey
-    .replace(/https?:\/\/\S+/gi, "[REDACTED_URL]")
-    .replace(/(["']).*?\1/g, "$1[REDACTED]$1")
-    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[REDACTED_TOKEN]")
-    .replace(/[\r\n\t]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 300);
-  return sanitized || null;
-}
-
 interface PromptFeedbackDetails {
   blockReason: string | null;
-  blockReasonMessage: string | null;
 }
 
-function promptFeedbackFromResponse(
-  response: unknown,
-  apiKey: string,
-): PromptFeedbackDetails {
+function promptFeedbackFromResponse(response: unknown): PromptFeedbackDetails {
   const promptFeedback = isRecord(response) && isRecord(response.promptFeedback)
     ? response.promptFeedback
     : null;
@@ -220,28 +205,22 @@ function promptFeedbackFromResponse(
       promptFeedback && typeof promptFeedback.blockReason === "string"
         ? promptFeedback.blockReason
         : null,
-    blockReasonMessage: sanitizedGoogleMessage(
-      promptFeedback?.blockReasonMessage,
-      apiKey,
-    ),
   };
 }
 
 interface GoogleErrorDetails {
   status: string | null;
-  message: string | null;
 }
 
 async function readGoogleError(
   response: Response,
-  apiKey: string,
 ): Promise<GoogleErrorDetails> {
   let payload: unknown;
 
   try {
     payload = JSON.parse(await response.text());
   } catch {
-    return { status: null, message: null };
+    return { status: null };
   }
 
   const error = isRecord(payload) && isRecord(payload.error)
@@ -249,7 +228,6 @@ async function readGoogleError(
     : null;
   return {
     status: error && typeof error.status === "string" ? error.status : null,
-    message: sanitizedGoogleMessage(error?.message, apiKey),
   };
 }
 
@@ -267,6 +245,12 @@ function httpError(
     return new GeminiProviderError(
       "authentication",
       "The Gemini API key is invalid or restricted.",
+    );
+  }
+  if (status === 404 || googleStatus === "NOT_FOUND") {
+    return new GeminiProviderError(
+      "model_unavailable",
+      "The configured Gemini answer model is unavailable. Contact the application administrator.",
     );
   }
   if (status === 429) {
@@ -307,6 +291,11 @@ export async function requestGeminiText(
       ? options.outputTokenBudget
       : Math.min(options.outputTokenBudget * 2, MAX_RETRY_OUTPUT_TOKENS);
     let response: Response;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      options.timeoutMs ?? GEMINI_ANSWER_TIMEOUT_MS,
+    );
 
     try {
       response = await fetchGemini(geminiGenerateContentUrl(options.model), {
@@ -318,37 +307,42 @@ export async function requestGeminiText(
         body: JSON.stringify(
           createGeminiGenerateContentRequestBody(options, outputBudget),
         ),
+        signal: controller.signal,
       });
     } catch {
+      const timedOut = controller.signal.aborted;
       logDiagnostic("error", {
+        requestId: options.requestId,
+        stage: options.callStage,
         httpStatus: null,
-        googleErrorStatus: null,
-        googleErrorMessage: null,
-        promptFeedbackBlockReason: null,
-        promptFeedbackBlockReasonMessage: null,
         model: options.model,
         outputBudget,
         finishReason: null,
+        reasonCode: timedOut ? "timeout" : "network_failure",
       });
       throw new GeminiProviderError(
-        "network_failure",
-        "Could not reach Gemini. Please try again.",
+        timedOut ? "timeout" : "network_failure",
+        timedOut
+          ? "The Gemini request timed out. Please try again."
+          : "Could not reach Gemini. Please try again.",
       );
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     if (!response.ok) {
-      const googleError = await readGoogleError(response, options.apiKey);
+      const googleError = await readGoogleError(response);
+      const providerError = httpError(response.status, googleError.status);
       logDiagnostic("error", {
+        requestId: options.requestId,
+        stage: options.callStage,
         httpStatus: response.status,
-        googleErrorStatus: googleError.status,
-        googleErrorMessage: googleError.message,
-        promptFeedbackBlockReason: null,
-        promptFeedbackBlockReasonMessage: null,
         model: options.model,
         outputBudget,
         finishReason: null,
+        reasonCode: providerError.code,
       });
-      throw httpError(response.status, googleError.status);
+      throw providerError;
     }
 
     let payload: unknown;
@@ -357,14 +351,13 @@ export async function requestGeminiText(
       payload = await response.json();
     } catch {
       logDiagnostic("error", {
+        requestId: options.requestId,
+        stage: options.callStage,
         httpStatus: response.status,
-        googleErrorStatus: null,
-        googleErrorMessage: null,
-        promptFeedbackBlockReason: null,
-        promptFeedbackBlockReasonMessage: null,
         model: options.model,
         outputBudget,
         finishReason: null,
+        reasonCode: "provider_failure",
       });
       throw new GeminiProviderError(
         "provider_failure",
@@ -373,33 +366,47 @@ export async function requestGeminiText(
     }
 
     const finishReason = finishReasonFromResponse(payload);
-    const promptFeedback = promptFeedbackFromResponse(payload, options.apiKey);
+    const promptFeedback = promptFeedbackFromResponse(payload);
+
+    if (promptFeedback.blockReason) {
+      logDiagnostic("error", {
+        requestId: options.requestId,
+        stage: options.callStage,
+        httpStatus: response.status,
+        model: options.model,
+        outputBudget,
+        finishReason,
+        reasonCode: "safety",
+      });
+      throw new GeminiProviderError(
+        "safety",
+        "Gemini blocked the response for safety reasons.",
+      );
+    }
 
     try {
       const result = extractGeminiGenerateContentText(payload);
       logDiagnostic("info", {
+        requestId: options.requestId,
+        stage: options.callStage,
         httpStatus: response.status,
-        googleErrorStatus: null,
-        googleErrorMessage: null,
-        promptFeedbackBlockReason: null,
-        promptFeedbackBlockReasonMessage: null,
         model: options.model,
         outputBudget,
         finishReason: result.finishReason,
+        reasonCode: "none",
       });
       return result.text;
     } catch (error) {
       if (!(error instanceof GeminiProviderError)) throw error;
 
       logDiagnostic("error", {
+        requestId: options.requestId,
+        stage: options.callStage,
         httpStatus: response.status,
-        googleErrorStatus: null,
-        googleErrorMessage: null,
-        promptFeedbackBlockReason: promptFeedback.blockReason,
-        promptFeedbackBlockReasonMessage: promptFeedback.blockReasonMessage,
         model: options.model,
         outputBudget,
         finishReason,
+        reasonCode: error.code,
       });
 
       if (error.code === "output_limit" && attempt === 1) continue;

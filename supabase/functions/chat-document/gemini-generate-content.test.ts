@@ -37,6 +37,7 @@ function requestOptions(
   mode: ResponseMode = "concise",
 ): Parameters<typeof requestGeminiText>[0] {
   return {
+    requestId: "11111111-1111-4111-8111-111111111111",
     model: DEFAULT_GEMINI_MODEL,
     apiKey: "test-api-key",
     responseMode: mode,
@@ -198,6 +199,45 @@ Deno.test("503 maps to temporary Gemini unavailability", async () => {
   );
 });
 
+Deno.test("404 maps to an invalid answer model", async () => {
+  await assertProviderError(
+    googleErrorResponse(404, "NOT_FOUND", "Model was not found."),
+    "model_unavailable",
+    "The configured Gemini answer model is unavailable. Contact the application administrator.",
+  );
+});
+
+Deno.test("provider timeouts are distinct from network failures", async () => {
+  const options = { ...requestOptions(), timeoutMs: 1 };
+
+  try {
+    await requestGeminiText(
+      options,
+      async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+      NO_DIAGNOSTIC_LOG,
+    );
+  } catch (error) {
+    if (error instanceof GeminiProviderError && error.code === "timeout") {
+      return;
+    }
+    throw error;
+  }
+
+  throw new Error("Timed-out Gemini request unexpectedly succeeded.");
+});
+
 Deno.test("MAX_TOKENS retries once with a doubled budget", async () => {
   const budgets: number[] = [];
   const fetchGemini: GeminiFetch = async (_input, init) => {
@@ -259,7 +299,7 @@ Deno.test("empty candidates return an empty-response error", () => {
   throw new Error("Empty candidates unexpectedly succeeded.");
 });
 
-Deno.test("empty candidates safely log prompt feedback", async () => {
+Deno.test("prompt feedback maps to a blocked response without logging its message", async () => {
   const diagnostics: GeminiSafeDiagnostics[] = [];
   const options = requestOptions();
 
@@ -283,7 +323,7 @@ Deno.test("empty candidates safely log prompt feedback", async () => {
   } catch (error) {
     if (
       !(error instanceof GeminiProviderError) ||
-      error.code !== "empty_response"
+      error.code !== "safety"
     ) {
       throw error;
     }
@@ -291,15 +331,10 @@ Deno.test("empty candidates safely log prompt feedback", async () => {
 
   assertEquals(diagnostics[0].httpStatus, 200);
   assertEquals(diagnostics[0].model, DEFAULT_GEMINI_MODEL);
-  assertEquals(diagnostics[0].promptFeedbackBlockReason, "SAFETY");
+  assertEquals(diagnostics[0].reasonCode, "safety");
+  assertEquals(JSON.stringify(diagnostics[0]).includes(options.apiKey), false);
   assertEquals(
-    diagnostics[0].promptFeedbackBlockReasonMessage?.includes(options.apiKey),
-    false,
-  );
-  assertEquals(
-    diagnostics[0].promptFeedbackBlockReasonMessage?.includes(
-      "private excerpt",
-    ),
+    JSON.stringify(diagnostics[0]).includes("private excerpt"),
     false,
   );
 });
@@ -371,17 +406,16 @@ Deno.test("provider diagnostics contain only approved safe fields", async () => 
 
   assertEquals(Object.keys(diagnostics[0]).sort(), [
     "finishReason",
-    "googleErrorMessage",
-    "googleErrorStatus",
     "httpStatus",
     "model",
     "outputBudget",
-    "promptFeedbackBlockReason",
-    "promptFeedbackBlockReasonMessage",
+    "reasonCode",
+    "requestId",
+    "stage",
   ]);
 });
 
-Deno.test("Google error diagnostics redact keys and quoted content", async () => {
+Deno.test("Google error diagnostics omit keys and provider message text", async () => {
   const diagnostics: GeminiSafeDiagnostics[] = [];
   const options = requestOptions();
 
@@ -406,11 +440,11 @@ Deno.test("Google error diagnostics redact keys and quoted content", async () =>
   }
 
   assertEquals(
-    diagnostics[0].googleErrorMessage?.includes(options.apiKey),
+    JSON.stringify(diagnostics[0]).includes(options.apiKey),
     false,
   );
   assertEquals(
-    diagnostics[0].googleErrorMessage?.includes("private document excerpt"),
+    JSON.stringify(diagnostics[0]).includes("private document excerpt"),
     false,
   );
 });

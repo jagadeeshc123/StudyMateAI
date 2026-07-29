@@ -28,6 +28,13 @@ export function setActiveBatch(userId: string, documentIds: string[]): void {
   sessionStorage.setItem(storageKey(userId), JSON.stringify(safeIds));
 }
 
+export function removeFromActiveBatch(userId: string, documentId: string): void {
+  setActiveBatch(
+    userId,
+    getActiveBatch(userId).filter((id) => id !== documentId),
+  );
+}
+
 export function clearAllActiveBatches(): void {
   for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
     const key = sessionStorage.key(index);

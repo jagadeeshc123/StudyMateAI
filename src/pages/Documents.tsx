@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { FileText, MessageSquare, Pencil, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
-import { setActiveBatch } from "@/integrations/supabase/active-batch";
+import { removeFromActiveBatch, setActiveBatch } from "@/integrations/supabase/active-batch";
 import Navbar from "@/components/Navbar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -87,6 +87,7 @@ const Documents = () => {
   }, [refreshDocuments]);
 
   const openRename = (document: ManagedDocument) => {
+    if (renaming || deletingId || retryingId || embeddingId) return;
     setRenameTarget(document);
     setRenameValue(documentTitle(document));
     setRenameError(null);
@@ -94,7 +95,7 @@ const Documents = () => {
 
   const submitRename = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!renameTarget || renaming) return;
+    if (!renameTarget || renaming || deletingId || retryingId || embeddingId) return;
 
     const validationError = validateDisplayName(renameValue);
     if (validationError) {
@@ -120,7 +121,7 @@ const Documents = () => {
   };
 
   const confirmDelete = async () => {
-    if (!deleteTarget || deletingId) return;
+    if (!deleteTarget || deletingId || renaming || retryingId || embeddingId) return;
 
     const target = deleteTarget;
     setDeleteTarget(null);
@@ -131,6 +132,7 @@ const Documents = () => {
 
     try {
       await deleteDocument(target.id);
+      if (user) removeFromActiveBatch(user.id, target.id);
       setDocuments((current) => current.filter((document) => document.id !== target.id));
       toast.success("Document and its private file were deleted.");
     } catch (error) {
@@ -143,7 +145,7 @@ const Documents = () => {
   };
 
   const retryProcessing = async (document: ManagedDocument) => {
-    if (retryingId || !["failed", "uploaded"].includes(document.processing_status)) return;
+    if (retryingId || deletingId || renaming || embeddingId || !["failed", "uploaded"].includes(document.processing_status)) return;
 
     setRetryingId(document.id);
     setDocuments((current) => current.map((item) =>
@@ -164,15 +166,15 @@ const Documents = () => {
   };
 
   const backfillEmbeddings = async (document: ManagedDocument) => {
-    if (embeddingId || document.processing_status !== "ready") return;
+    if (embeddingId || deletingId || renaming || retryingId || document.processing_status !== "ready") return;
 
     setEmbeddingId(document.id);
     try {
       const result = await backfillDocumentEmbeddings(document.id);
       if (result.embedding.status === "failed") {
         toast.error(
-          result.embedding.error ??
-            "Semantic indexing could not finish. Keyword search is still available.",
+          `${result.embedding.error ??
+            "Semantic indexing could not finish. Keyword search is still available."} Request ID: ${result.requestId}`,
         );
       } else {
         toast.success(
@@ -225,7 +227,8 @@ const Documents = () => {
                 const status = document.id === deletingId ? "deleting" : document.processing_status;
                 const retryable = status === "failed" || status === "uploaded";
                 const operationBusy = document.id === deletingId ||
-                  document.id === retryingId || document.id === embeddingId;
+                  document.id === retryingId || document.id === embeddingId ||
+                  renaming || Boolean(deletingId || retryingId || embeddingId);
 
                 return (
                   <Card key={document.id} className="border-2">

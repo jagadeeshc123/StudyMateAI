@@ -5,7 +5,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(26);
+select plan(33);
 
 create temporary table phase1_test_context on commit drop as
 with generated as (
@@ -104,6 +104,22 @@ select
   user_b_id,
   user_b_id::text,
   '{}'::jsonb
+from phase1_test_context
+union all
+select
+  'documents',
+  format('%s/%s.pdf', user_a_id, document_a_id),
+  user_a_id,
+  user_a_id::text,
+  '{}'::jsonb
+from phase1_test_context
+union all
+select
+  'documents',
+  format('%s/%s.pdf', user_b_id, document_b_id),
+  user_b_id,
+  user_b_id::text,
+  '{}'::jsonb
 from phase1_test_context;
 
 set local role authenticated;
@@ -120,10 +136,43 @@ select is((select count(*) from public.documents), 1::bigint, 'User A reads only
 select is((select count(*) from public.document_chunks), 1::bigint, 'User A reads only User A chunks');
 select is((select count(*) from public.messages), 1::bigint, 'User A reads only User A messages');
 select is(
+  (select count(*) from public.documents where id = (select document_b_id from phase1_test_context)),
+  0::bigint,
+  'A guessed foreign document UUID cannot bypass document RLS'
+);
+select is(
   (select count(*) from storage.objects where bucket_id = 'documents'),
-  1::bigint,
+  2::bigint,
   'User A reads only User A Storage folder when filenames are duplicated between users'
 );
+
+-- Local Storage schema guards direct SQL deletes even when RLS would return no
+-- rows. The Storage API sets this transaction-local flag before its DELETE.
+select set_config('storage.allow_delete_query', 'true', true);
+
+with affected as (
+  delete from storage.objects
+  where bucket_id = 'documents'
+    and name = format(
+      '%s/%s.pdf',
+      (select user_a_id from phase1_test_context),
+      (select document_a_id from phase1_test_context)
+    )
+  returning 1
+)
+select is((select count(*) from affected), 0::bigint, 'Browser cannot delete a registered private file');
+
+with affected as (
+  delete from storage.objects
+  where bucket_id = 'documents'
+    and name = format(
+      '%s/%s',
+      (select user_a_id from phase1_test_context),
+      (select shared_storage_file_name from phase1_test_context)
+    )
+  returning 1
+)
+select is((select count(*) from affected), 1::bigint, 'Browser may clean up only its own unregistered upload');
 select is((select count(*) from public.list_documents()), 1::bigint, 'list_documents is caller-scoped');
 select is((select count(*) from public.list_user_documents()), 1::bigint, 'list_user_documents is caller-scoped');
 
@@ -134,6 +183,15 @@ select ok(
     'EXECUTE'
   ),
   'Browser roles cannot execute the privileged hybrid-search function'
+);
+
+select ok(
+  not has_function_privilege(
+    'authenticated',
+    'public.search_document_chunks(uuid,text,integer)',
+    'EXECUTE'
+  ),
+  'Browser roles cannot bypass ownership through keyword-search RPC'
 );
 
 select ok(
@@ -179,35 +237,33 @@ with affected as (
 )
 select is((select count(*) from affected), 0::bigint, 'User A cannot rename User B documents');
 
-with affected as (
-  update public.document_chunks
-  set content = format('changed-%s', id)
-  where document_id = (select document_b_id from phase1_test_context)
-  returning 1
-)
-select is((select count(*) from affected), 0::bigint, 'User A cannot update User B chunks');
+do $$ begin
+  begin update public.document_chunks set content = 'forbidden' where true;
+    raise exception 'browser chunk UPDATE unexpectedly succeeded';
+  exception when insufficient_privilege then null; end;
+end $$;
+select pass('Browser cannot update server-managed chunks, including another user chunks');
 
-with affected as (
-  update public.messages
-  set content = format('changed-%s', id)
-  where document_id = (select document_b_id from phase1_test_context)
-  returning 1
-)
-select is((select count(*) from affected), 0::bigint, 'User A cannot update User B messages');
+do $$ begin
+  begin update public.messages set content = 'forbidden' where true;
+    raise exception 'browser message UPDATE unexpectedly succeeded';
+  exception when insufficient_privilege then null; end;
+end $$;
+select pass('Browser cannot update server-managed messages, including another user messages');
 
-with affected as (
-  delete from public.document_chunks
-  where document_id = (select document_b_id from phase1_test_context)
-  returning 1
-)
-select is((select count(*) from affected), 0::bigint, 'User A cannot delete User B chunks');
+do $$ begin
+  begin delete from public.document_chunks where true;
+    raise exception 'browser chunk DELETE unexpectedly succeeded';
+  exception when insufficient_privilege then null; end;
+end $$;
+select pass('Browser cannot delete server-managed chunks, including another user chunks');
 
-with affected as (
-  delete from public.messages
-  where document_id = (select document_b_id from phase1_test_context)
-  returning 1
-)
-select is((select count(*) from affected), 0::bigint, 'User A cannot delete User B messages');
+do $$ begin
+  begin delete from public.messages where true;
+    raise exception 'browser message DELETE unexpectedly succeeded';
+  exception when insufficient_privilege then null; end;
+end $$;
+select pass('Browser cannot delete server-managed messages, including another user messages');
 
 select public.clear_user_history((select document_b_id from phase1_test_context));
 reset role;
@@ -296,6 +352,22 @@ select pass('Cross-user document, chunk, and message inserts are rejected');
 do $$
 begin
   begin
+    insert into public.documents (
+      user_id, original_file_name, storage_path, file_size, mime_type, processing_status
+    )
+    select user_a_id, 'forged-ready.pdf', format('%s/%s.pdf', user_a_id, gen_random_uuid()),
+      100, 'application/pdf', 'ready'
+    from phase1_test_context;
+    raise exception 'forged ready document unexpectedly succeeded';
+  exception when insufficient_privilege then null;
+  end;
+end
+$$;
+select pass('Browser cannot forge a server-managed document processing state');
+
+do $$
+begin
+  begin
     insert into storage.objects (bucket_id, name, owner, owner_id, metadata)
     select
       'documents',
@@ -356,11 +428,11 @@ select is(
   'Clearing history removes the caller-owned messages'
 );
 
+reset role;
+
 insert into public.messages (document_id, role, content)
 select document_a_id, 'user', format('cascade-%s', document_a_id)
 from phase1_test_context;
-
-reset role;
 
 with affected as (
   delete from public.documents
@@ -396,6 +468,43 @@ select is(
   (select count(*) from public.documents),
   1::bigint,
   'Switching the simulated session to User B reveals only User B documents'
+);
+
+reset role;
+
+insert into public.documents (
+  id, user_id, original_file_name, storage_path, file_size, mime_type, processing_status
+)
+select
+  forbidden_document_id,
+  user_b_id,
+  file_name_b,
+  format('%s/%s.pdf', user_b_id, forbidden_document_id),
+  100,
+  'application/pdf',
+  'uploaded'
+from phase1_test_context;
+
+select is(
+  (
+    select count(distinct id)
+    from public.documents
+    where user_id = (select user_b_id from phase1_test_context)
+      and original_file_name = (select file_name_b from phase1_test_context)
+  ),
+  2::bigint,
+  'Same-user duplicate filenames receive different document IDs'
+);
+
+select is(
+  (
+    select count(distinct storage_path)
+    from public.documents
+    where user_id = (select user_b_id from phase1_test_context)
+      and original_file_name = (select file_name_b from phase1_test_context)
+  ),
+  2::bigint,
+  'Same-user duplicate filenames retain independent Storage paths'
 );
 
 select * from finish();

@@ -68,9 +68,13 @@ class TestQuery implements PromiseLike<QueryResult> {
     return this;
   }
 
-  or(): this {
-    // Tests contain no stale processing rows, so the recovery OR predicate is
-    // intentionally a no-op in this focused in-memory adapter.
+  or(expression: string): this {
+    const cutoff = expression.match(/embedded_at\.lt\.(.+)$/)?.[1];
+    if (cutoff) {
+      this.filters.push((chunk) =>
+        chunk.embedded_at === null || chunk.embedded_at < cutoff
+      );
+    }
     return this;
   }
 
@@ -235,4 +239,75 @@ Deno.test("a partial embedding save failure preserves completed chunks", async (
   assertEquals(first.embedding_status, "ready");
   assertEquals(second.embedding_status, "failed");
   assertEquals(second.content, "Second chunk save fails.");
+});
+
+Deno.test("stale processing leases recover without stealing fresh work", async () => {
+  const stale = testChunk("chunk-1", "Interrupted stale embedding work.");
+  stale.embedding_status = "processing";
+  stale.embedded_at = "2000-01-01T00:00:00.000Z";
+  const fresh = testChunk("chunk-2", "Another request still owns this work.");
+  fresh.embedding_status = "processing";
+  fresh.embedded_at = new Date().toISOString();
+  const database = new TestDatabase([stale, fresh]);
+  let requestCount = 0;
+
+  const result = await embedDocumentChunks(
+    database as never,
+    "document-1",
+    "test-key",
+    "Lease Test.pdf",
+    async () => {
+      requestCount += 1;
+      return vectorResponse();
+    },
+    NO_DELAY,
+  );
+
+  assertEquals(result.embeddedChunks, 1);
+  assertEquals(requestCount, 1);
+  assertEquals(stale.embedding_status, "ready");
+  assertEquals(fresh.embedding_status, "processing");
+});
+
+Deno.test("a concurrent backfill cannot duplicate claimed provider work", async () => {
+  const chunk = testChunk("chunk-1", "Claim this chunk only once.");
+  const database = new TestDatabase([chunk]);
+  let releaseProvider!: () => void;
+  let providerStarted!: () => void;
+  const started = new Promise<void>((resolve) => providerStarted = resolve);
+  const release = new Promise<void>((resolve) => releaseProvider = resolve);
+  let requestCount = 0;
+
+  const first = embedDocumentChunks(
+    database as never,
+    "document-1",
+    "test-key",
+    "Concurrency Test.pdf",
+    async () => {
+      requestCount += 1;
+      providerStarted();
+      await release;
+      return vectorResponse();
+    },
+    NO_DELAY,
+  );
+
+  await started;
+  const second = await embedDocumentChunks(
+    database as never,
+    "document-1",
+    "test-key",
+    "Concurrency Test.pdf",
+    async () => {
+      requestCount += 1;
+      return vectorResponse();
+    },
+    NO_DELAY,
+  );
+  releaseProvider();
+  await first;
+
+  assertEquals(second.status, "skipped");
+  assertEquals(requestCount, 1);
+  assertEquals(chunk.embedding_status, "ready");
 });

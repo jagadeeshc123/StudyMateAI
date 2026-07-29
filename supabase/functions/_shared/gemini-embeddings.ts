@@ -7,6 +7,7 @@ const GEMINI_MODELS_ROOT =
   "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_TRANSIENT_RETRIES = 2;
 const INITIAL_RETRY_DELAY_MS = 500;
+export const GEMINI_EMBEDDING_TIMEOUT_MS = 30_000;
 
 export type GeminiEmbeddingErrorCode =
   | "invalid_request"
@@ -15,6 +16,7 @@ export type GeminiEmbeddingErrorCode =
   | "quota"
   | "temporarily_unavailable"
   | "network_failure"
+  | "timeout"
   | "invalid_response"
   | "dimension_mismatch";
 
@@ -33,6 +35,7 @@ export interface GeminiEmbeddingOptions {
   apiKey: string;
   model: string;
   dimensions: number;
+  timeoutMs?: number;
 }
 
 export interface GeminiEmbeddingDiagnostics {
@@ -222,6 +225,11 @@ async function requestEmbedding(
 ): Promise<number[]> {
   for (let attempt = 1; attempt <= MAX_TRANSIENT_RETRIES + 1; attempt += 1) {
     let response: Response;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      options.timeoutMs ?? GEMINI_EMBEDDING_TIMEOUT_MS,
+    );
 
     try {
       response = await fetchEmbedding(embeddingUrl(options.model), {
@@ -231,11 +239,15 @@ async function requestEmbedding(
           "x-goog-api-key": options.apiKey,
         },
         body: JSON.stringify(createEmbeddingRequestBody(text, options)),
+        signal: controller.signal,
       });
     } catch {
+      const timedOut = controller.signal.aborted;
       const error = new GeminiEmbeddingError(
-        "network_failure",
-        "The Gemini embedding network request failed. Keyword search remains available.",
+        timedOut ? "timeout" : "network_failure",
+        timedOut
+          ? "The Gemini embedding request timed out. Keyword search remains available."
+          : "The Gemini embedding network request failed. Keyword search remains available.",
         true,
       );
       logDiagnostic("error", {
@@ -253,6 +265,8 @@ async function requestEmbedding(
         continue;
       }
       throw error;
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     if (!response.ok) {

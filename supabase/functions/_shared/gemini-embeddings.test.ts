@@ -248,6 +248,38 @@ Deno.test("invalid requests and unavailable models use distinct errors", async (
   }
 });
 
+Deno.test("embedding timeout is distinct and preserves keyword fallback guidance", async () => {
+  try {
+    await generateGeminiEmbeddings(
+      [formatEmbeddingQuery("timeout test")],
+      { ...embeddingOptions(), timeoutMs: 1 },
+      async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+      NO_LOG,
+      NO_DELAY,
+    );
+  } catch (error) {
+    if (
+      error instanceof GeminiEmbeddingError && error.code === "timeout" &&
+      error.message.includes("Keyword search remains available")
+    ) return;
+    throw error;
+  }
+
+  throw new Error("Timed-out embedding request unexpectedly succeeded.");
+});
+
 Deno.test("embedding network failures stop after bounded retries", async () => {
   let requestCount = 0;
 

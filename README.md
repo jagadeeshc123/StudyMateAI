@@ -41,6 +41,7 @@ Alternatively, run these files in timestamp order using **Supabase Dashboard -> 
 4. `supabase/migrations/20260727130000_phase1_document_management.sql`
 5. `supabase/migrations/20260727160000_phase1_security_hardening.sql`
 6. `supabase/migrations/20260729120000_phase2_pgvector_hybrid_search.sql`
+7. `supabase/migrations/20260730120000_phase2_5_integrity_hardening.sql`
 
 In **Supabase Dashboard -> Storage**, confirm the `documents` bucket exists and **Public bucket** is disabled. The first migration creates and configures it automatically when run as written.
 
@@ -75,6 +76,8 @@ npx supabase functions deploy delete-document --project-ref "$PROJECT_REF"
 
 JWT verification remains enabled. The frontend explicitly sends the current user's access token, and each function calls `auth.getUser()`, checks document ownership, and only then performs service-role operations.
 
+Apply the Phase 2.5 migration before deploying these function versions. It prevents browsers from mutating extracted chunks/messages or deleting registered Storage objects outside the managed deletion function.
+
 ## Install and run the frontend
 
 ```sh
@@ -94,12 +97,16 @@ npm run preview
 ## Verification commands
 
 ```sh
-npx tsc --noEmit
-deno check --config supabase/functions/deno.json supabase/functions/process-document/index.ts supabase/functions/chat-document/index.ts supabase/functions/delete-document/index.ts
+npx tsc -p tsconfig.app.json --noEmit
+npx -y deno check --config supabase/functions/deno.json supabase/functions/process-document/index.ts supabase/functions/chat-document/index.ts supabase/functions/delete-document/index.ts
+npx -y deno test --allow-env supabase/functions
 npm run build
 npm run lint
+npx supabase db reset
+npx supabase db lint --local
 npx supabase test db supabase/tests/ownership_rls.sql
 npx supabase test db supabase/tests/phase2_hybrid_search.sql
+git diff --check
 ```
 
 The SQL test checks cross-user RLS for documents, chunks, messages, document statistics, rename behavior, display-name validation, and history clearing against a local Supabase database. Also perform the two-account browser test after deploying the migration and functions.

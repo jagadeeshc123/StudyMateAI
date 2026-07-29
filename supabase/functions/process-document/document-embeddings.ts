@@ -3,12 +3,17 @@ import {
   embeddingToPostgres,
   formatEmbeddingDocument,
   GEMINI_EMBEDDING_BATCH_SIZE,
+  GeminiEmbeddingError,
   type GeminiEmbeddingFetch,
   generateGeminiEmbeddings,
   normalizeEmbeddingText,
   stableContentHash,
 } from "../_shared/gemini-embeddings.ts";
 import { createSupabaseAdminClient } from "../_shared/supabase-admin.ts";
+import {
+  logOperational,
+  type SafeReasonCode,
+} from "../_shared/request-context.ts";
 
 const CHUNK_LOAD_PAGE_SIZE = 500;
 const FREE_TIER_BATCH_PAUSE_MS = 6_000;
@@ -95,10 +100,27 @@ async function loadDocumentChunks(
 }
 
 function safeEmbeddingError(error: unknown): string {
-  const message = error instanceof Error
-    ? error.message
-    : "Unknown embedding failure.";
-  return message.replace(/[\r\n\t]+/g, " ").trim().slice(0, 500);
+  if (error instanceof GeminiEmbeddingError) return error.message;
+  return "Semantic indexing failed. Keyword search remains available.";
+}
+
+function embeddingReasonCode(errorCode: string): SafeReasonCode {
+  switch (errorCode) {
+    case "authentication":
+      return "provider_authentication";
+    case "quota":
+      return "provider_quota";
+    case "model_unavailable":
+      return "provider_model_unavailable";
+    case "timeout":
+      return "provider_timeout";
+    case "network_failure":
+      return "provider_network_failure";
+    case "dimension_mismatch":
+      return "provider_invalid_dimension";
+    default:
+      return "provider_unavailable";
+  }
 }
 
 async function markEmbeddingBatchFailed(
@@ -106,6 +128,7 @@ async function markEmbeddingBatchFailed(
   chunkIds: string[],
   model: string,
   errorMessage: string,
+  requestId: string,
 ): Promise<void> {
   if (chunkIds.length === 0) return;
 
@@ -122,9 +145,12 @@ async function markEmbeddingBatchFailed(
     .eq("embedding_status", "processing");
 
   if (error) {
-    console.error("Could not record embedding batch failure", {
+    logOperational("error", {
+      requestId,
+      stage: "process-document-record-embedding-batch-failure",
+      httpStatus: 500,
+      reasonCode: "database_failure",
       chunkCount: chunkIds.length,
-      error: error.message,
     });
   }
 }
@@ -139,6 +165,7 @@ export async function embedDocumentChunks(
   documentTitle: string | null,
   fetchEmbedding: GeminiEmbeddingFetch = fetch,
   delay: (milliseconds: number) => Promise<void> = defaultDelay,
+  requestId: string = crypto.randomUUID(),
 ): Promise<DocumentEmbeddingResult> {
   const configuration = embeddingConfigurationFromEnvironment();
   const staleBefore = new Date(
@@ -225,7 +252,17 @@ export async function embedDocumentChunks(
           dimensions: configuration.dimensions,
         },
         fetchEmbedding,
-        undefined,
+        (level, diagnostic) =>
+          logOperational(level, {
+            requestId,
+            stage: "process-document-embedding-provider",
+            httpStatus: diagnostic.httpStatus ?? 0,
+            reasonCode: diagnostic.errorCode === "none"
+              ? "none"
+              : embeddingReasonCode(diagnostic.errorCode),
+            model: diagnostic.model,
+            chunkCount: diagnostic.inputCount,
+          }),
         delay,
       );
 
@@ -261,6 +298,7 @@ export async function embedDocumentChunks(
         failedBatch.map((chunk) => chunk.id),
         configuration.model,
         lastError,
+        requestId,
       );
       break;
     }
@@ -270,13 +308,13 @@ export async function embedDocumentChunks(
     }
   }
 
-  console.info("document embedding result", {
-    documentId,
+  logOperational(failedChunks > 0 ? "warn" : "info", {
+    requestId,
+    stage: "process-document-embedding-result",
+    httpStatus: 200,
+    reasonCode: failedChunks > 0 ? "provider_unavailable" : "none",
     model: configuration.model,
-    totalChunks: chunks.length,
-    embeddedChunks,
-    skippedChunks,
-    failedChunks,
+    chunkCount: chunks.length,
   });
 
   return {

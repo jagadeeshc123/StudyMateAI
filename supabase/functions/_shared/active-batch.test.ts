@@ -1,6 +1,7 @@
 import {
   clearAllActiveBatches,
   getActiveBatch,
+  removeFromActiveBatch,
   setActiveBatch,
 } from "../../../src/integrations/supabase/active-batch.ts";
 
@@ -37,6 +38,21 @@ Object.defineProperty(globalThis, "sessionStorage", {
   value: new MemoryStorage(),
 });
 
+Deno.test("deleting a document prunes only that active selection", () => {
+  const userId = crypto.randomUUID();
+  const firstDocument = crypto.randomUUID();
+  const secondDocument = crypto.randomUUID();
+
+  setActiveBatch(userId, [firstDocument, secondDocument]);
+  removeFromActiveBatch(userId, firstDocument);
+
+  if (getActiveBatch(userId).join() !== secondDocument) {
+    throw new Error(
+      "Deleting one document corrupted the remaining active selection.",
+    );
+  }
+});
+
 Deno.test("active batches are user-scoped, validated, and cleared on account change", () => {
   const userA = crypto.randomUUID();
   const userB = crypto.randomUUID();
@@ -56,7 +72,9 @@ Deno.test("active batches are user-scoped, validated, and cleared on account cha
 
   clearAllActiveBatches();
 
-  if (getActiveBatch(userA).length !== 0 || getActiveBatch(userB).length !== 0) {
+  if (
+    getActiveBatch(userA).length !== 0 || getActiveBatch(userB).length !== 0
+  ) {
     throw new Error("Account transition did not clear user-specific batches.");
   }
 });

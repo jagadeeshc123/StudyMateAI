@@ -4,8 +4,15 @@ import { HttpError, requireAuthenticatedUser } from "../_shared/auth.ts";
 import { createSupabaseAdminClient } from "../_shared/supabase-admin.ts";
 import {
   DEFAULT_GEMINI_EMBEDDING_MODEL,
+  GeminiEmbeddingError,
   stableContentHash,
 } from "../_shared/gemini-embeddings.ts";
+import {
+  createRequestId,
+  logOperational,
+  requestJsonResponse,
+  type SafeReasonCode,
+} from "../_shared/request-context.ts";
 import { chunkExtractedPages } from "../_shared/text.ts";
 import {
   type DocumentEmbeddingResult,
@@ -31,35 +38,54 @@ async function attemptDocumentEmbeddings(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
   documentId: string,
   documentTitle: string | null,
+  requestId: string,
 ): Promise<DocumentEmbeddingResult> {
   const apiKey = Deno.env.get("GEMINI_API_KEY");
+  const targetModel = Deno.env.get("GEMINI_EMBEDDING_MODEL") ||
+    DEFAULT_GEMINI_EMBEDDING_MODEL;
 
   const recordFailure = async (errorMessage: string) => {
+    const failureValues = {
+      embedding: null,
+      embedding_status: "failed",
+      embedding_error: errorMessage,
+      embedding_model: targetModel,
+      embedded_at: null,
+    };
     const { error } = await supabase
       .from("document_chunks")
-      .update({
-        embedding: null,
-        embedding_status: "failed",
-        embedding_error: errorMessage,
-        embedding_model: Deno.env.get("GEMINI_EMBEDDING_MODEL") ||
-          DEFAULT_GEMINI_EMBEDDING_MODEL,
-        embedded_at: null,
-      })
+      .update(failureValues)
       .eq("document_id", documentId)
       .in("embedding_status", ["pending", "failed", "skipped"]);
 
-    if (error) {
-      console.error("Could not record document embedding failure", {
-        documentId,
-        error: error.message,
+    const { error: incompatibleError } = await supabase
+      .from("document_chunks")
+      .update(failureValues)
+      .eq("document_id", documentId)
+      .eq("embedding_status", "ready")
+      .neq("embedding_model", targetModel);
+
+    if (error || incompatibleError) {
+      logOperational("error", {
+        requestId,
+        stage: "process-document-record-embedding-failure",
+        httpStatus: 500,
+        reasonCode: "database_failure",
       });
     }
   };
 
   if (!apiKey) {
     const errorMessage =
-      "The server is missing GEMINI_API_KEY. Keyword search remains available.";
+      "Semantic indexing is not configured. Keyword search remains available.";
     await recordFailure(errorMessage);
+    logOperational("warn", {
+      requestId,
+      stage: "process-document-embeddings",
+      httpStatus: 200,
+      reasonCode: "provider_unavailable",
+      model: targetModel,
+    });
     return {
       status: "failed",
       totalChunks: 0,
@@ -76,12 +102,33 @@ async function attemptDocumentEmbeddings(
       documentId,
       apiKey,
       documentTitle,
+      fetch,
+      undefined,
+      requestId,
     );
   } catch (error) {
-    const errorMessage = getErrorMessage(error);
-    console.error("document embeddings unavailable", {
-      documentId,
-      error: errorMessage,
+    const errorMessage = error instanceof GeminiEmbeddingError
+      ? error.message
+      : "Semantic indexing failed. Keyword search remains available.";
+    logOperational("warn", {
+      requestId,
+      stage: "process-document-embeddings",
+      httpStatus: 200,
+      reasonCode: error instanceof GeminiEmbeddingError
+        ? error.code === "quota"
+          ? "provider_quota"
+          : error.code === "authentication"
+          ? "provider_authentication"
+          : error.code === "model_unavailable"
+          ? "provider_model_unavailable"
+          : error.code === "dimension_mismatch"
+          ? "provider_invalid_dimension"
+          : error.code === "network_failure"
+          ? "provider_network_failure"
+          : error.code === "timeout"
+          ? "provider_timeout"
+          : "provider_unavailable"
+        : "internal_failure",
     });
     await recordFailure(errorMessage);
     return {
@@ -104,6 +151,25 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: "Only POST requests are supported." }, 405);
   }
 
+  const requestId = createRequestId();
+  const startedAt = Date.now();
+  const respond = (body: Record<string, unknown>, status = 200) =>
+    requestJsonResponse(requestId, body, status);
+  const fail = (
+    message: string,
+    status: number,
+    reasonCode: SafeReasonCode,
+  ) => {
+    logOperational(status >= 500 ? "error" : "warn", {
+      requestId,
+      stage: "process-document",
+      httpStatus: status,
+      reasonCode,
+      durationMs: Date.now() - startedAt,
+    });
+    return respond({ error: message }, status);
+  };
+
   let supabase: ReturnType<typeof createSupabaseAdminClient> | null = null;
   let documentId: string | null = null;
   let documentExists = false;
@@ -119,7 +185,7 @@ Deno.serve(async (request) => {
       : "process";
 
     if (!documentId || !UUID_PATTERN.test(documentId)) {
-      return jsonResponse({ error: "A valid document ID is required." }, 400);
+      return fail("A valid document ID is required.", 400, "invalid_request");
     }
 
     const { data: document, error: documentError } = await callerSupabase
@@ -132,32 +198,15 @@ Deno.serve(async (request) => {
       .maybeSingle();
 
     if (documentError) {
-      throw new Error(
-        `Could not load the document record: ${documentError.message}`,
+      return fail(
+        "The document could not be checked before processing.",
+        500,
+        "database_failure",
       );
     }
 
     if (!document || document.user_id !== user.id) {
-      const ownershipLookup = createSupabaseAdminClient();
-      const { data: existingDocument, error: lookupError } =
-        await ownershipLookup
-          .from("documents")
-          .select("id")
-          .eq("id", documentId)
-          .maybeSingle();
-
-      if (lookupError) {
-        throw new Error(
-          `Could not verify document ownership: ${lookupError.message}`,
-        );
-      }
-
-      return existingDocument
-        ? jsonResponse(
-          { error: "You do not have access to this document." },
-          403,
-        )
-        : jsonResponse({ error: "Document not found." }, 404);
+      return fail("Document not found or unavailable.", 404, "not_found");
     }
 
     documentExists = true;
@@ -166,10 +215,11 @@ Deno.serve(async (request) => {
 
     if (action === "backfill_embeddings") {
       if (document.processing_status !== "ready") {
-        return jsonResponse({
-          error:
-            "Embeddings can only be created after PDF text extraction is ready.",
-        }, 409);
+        return fail(
+          "Embeddings can only be created after PDF text extraction is ready.",
+          409,
+          "conflict",
+        );
       }
 
       supabase = createSupabaseAdminClient();
@@ -177,8 +227,19 @@ Deno.serve(async (request) => {
         supabase,
         documentId,
         documentTitle,
+        requestId,
       );
-      return jsonResponse({
+      logOperational(embedding.status === "failed" ? "warn" : "info", {
+        requestId,
+        stage: "process-document-backfill-complete",
+        httpStatus: 200,
+        reasonCode: embedding.status === "failed"
+          ? "provider_unavailable"
+          : "none",
+        chunkCount: embedding.totalChunks,
+        durationMs: Date.now() - startedAt,
+      });
+      return respond({
         documentId,
         status: "ready",
         embedding,
@@ -193,11 +254,13 @@ Deno.serve(async (request) => {
       document.processing_status !== "uploaded" &&
       document.processing_status !== "failed"
     ) {
-      return jsonResponse({
-        error: document.processing_status === "processing"
+      return fail(
+        document.processing_status === "processing"
           ? "This document is already processing."
-          : `This document cannot be processed while its status is ${document.processing_status}.`,
-      }, 409);
+          : "This document is not in a retryable processing state.",
+        409,
+        "conflict",
+      );
     }
 
     supabase = createSupabaseAdminClient();
@@ -222,9 +285,11 @@ Deno.serve(async (request) => {
     }
 
     if (!claimedDocument) {
-      return jsonResponse({
-        error: "This document is already processing or is no longer retryable.",
-      }, 409);
+      return fail(
+        "This document is already processing or is no longer retryable.",
+        409,
+        "conflict",
+      );
     }
 
     const { error: clearChunksError } = await supabase
@@ -319,9 +384,18 @@ Deno.serve(async (request) => {
       supabase,
       documentId,
       documentTitle,
+      requestId,
     );
 
-    return jsonResponse({
+    logOperational("info", {
+      requestId,
+      stage: "process-document-complete",
+      httpStatus: 200,
+      reasonCode: "none",
+      chunkCount: chunks.length,
+      durationMs: Date.now() - startedAt,
+    });
+    return respond({
       documentId,
       status: "ready",
       pageCount: extracted.totalPages,
@@ -330,34 +404,46 @@ Deno.serve(async (request) => {
     });
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.message }, error.status);
+      return fail(error.message, error.status, error.reasonCode);
     }
 
     const errorMessage = getErrorMessage(error);
-    console.error("process-document failed", {
-      documentId,
-      error: errorMessage,
-    });
+    const safeErrorMessage =
+      errorMessage.startsWith("No searchable text was found")
+        ? errorMessage
+        : errorMessage === "The stored document is not a PDF."
+        ? errorMessage
+        : "PDF processing failed. Please retry or upload a different searchable PDF.";
+    const userInputFailure = safeErrorMessage.startsWith(
+      "No searchable text was found",
+    ) || safeErrorMessage === "The stored document is not a PDF.";
 
     if (supabase && documentId && documentExists) {
       const { error: failedStatusError } = await supabase
         .from("documents")
         .update({
           processing_status: "failed",
-          processing_error: errorMessage,
+          processing_error: safeErrorMessage,
           page_count: null,
         })
         .eq("id", documentId)
         .eq("processing_status", "processing");
 
       if (failedStatusError) {
-        console.error(
-          "Could not mark document as failed",
-          failedStatusError.message,
-        );
+        logOperational("error", {
+          requestId,
+          stage: "process-document-record-failure",
+          httpStatus: 500,
+          reasonCode: "database_failure",
+          durationMs: Date.now() - startedAt,
+        });
       }
     }
 
-    return jsonResponse({ error: errorMessage }, 500);
+    return fail(
+      safeErrorMessage,
+      userInputFailure ? 422 : 500,
+      userInputFailure ? "invalid_request" : "internal_failure",
+    );
   }
 });

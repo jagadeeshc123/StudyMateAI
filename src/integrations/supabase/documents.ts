@@ -14,6 +14,7 @@ export type ManagedDocument = Database["public"]["Functions"]["list_user_documen
 export type DocumentSummary = ManagedDocument;
 
 export interface ProcessDocumentResult {
+  requestId: string;
   documentId: string;
   status: "ready";
   pageCount?: number;
@@ -29,6 +30,7 @@ export interface ProcessDocumentResult {
 }
 
 export interface DeleteDocumentResult {
+  requestId: string;
   documentId: string;
   deleted: true;
 }

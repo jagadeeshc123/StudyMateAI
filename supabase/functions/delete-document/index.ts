@@ -1,8 +1,15 @@
 import { corsHeaders, jsonResponse } from "../_shared/cors.ts";
 import { HttpError, requireAuthenticatedUser } from "../_shared/auth.ts";
 import { createSupabaseAdminClient } from "../_shared/supabase-admin.ts";
+import {
+  createRequestId,
+  logOperational,
+  requestJsonResponse,
+  type SafeReasonCode,
+} from "../_shared/request-context.ts";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 interface DeleteDocumentBody {
   documentId?: unknown;
@@ -17,13 +24,36 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: "Only POST requests are supported." }, 405);
   }
 
+  const requestId = createRequestId();
+  const startedAt = Date.now();
+  const respond = (body: Record<string, unknown>, status = 200) =>
+    requestJsonResponse(requestId, body, status);
+  const fail = (
+    message: string,
+    status: number,
+    reasonCode: SafeReasonCode,
+  ) => {
+    logOperational(status >= 500 ? "error" : "warn", {
+      requestId,
+      stage: "delete-document",
+      httpStatus: status,
+      reasonCode,
+      durationMs: Date.now() - startedAt,
+    });
+    return respond({ error: message }, status);
+  };
+
   try {
-    const { user, supabase: callerSupabase } = await requireAuthenticatedUser(request);
+    const { user, supabase: callerSupabase } = await requireAuthenticatedUser(
+      request,
+    );
     const body = (await request.json()) as DeleteDocumentBody;
-    const documentId = typeof body.documentId === "string" ? body.documentId : "";
+    const documentId = typeof body.documentId === "string"
+      ? body.documentId
+      : "";
 
     if (!UUID_PATTERN.test(documentId)) {
-      return jsonResponse({ error: "A valid document ID is required." }, 400);
+      return fail("A valid document ID is required.", 400, "invalid_request");
     }
 
     const { data: document, error: documentError } = await callerSupabase
@@ -34,24 +64,15 @@ Deno.serve(async (request) => {
       .maybeSingle();
 
     if (documentError) {
-      throw new Error(`Could not load the document: ${documentError.message}`);
+      return fail(
+        "The document could not be checked before deletion.",
+        500,
+        "database_failure",
+      );
     }
 
     if (!document || document.user_id !== user.id) {
-      const ownershipLookup = createSupabaseAdminClient();
-      const { data: existingDocument, error: lookupError } = await ownershipLookup
-        .from("documents")
-        .select("id")
-        .eq("id", documentId)
-        .maybeSingle();
-
-      if (lookupError) {
-        throw new Error(`Could not verify document ownership: ${lookupError.message}`);
-      }
-
-      return existingDocument
-        ? jsonResponse({ error: "You do not have access to this document." }, 403)
-        : jsonResponse({ error: "Document not found." }, 404);
+      return fail("Document not found or unavailable.", 404, "not_found");
     }
 
     const previousStatus = document.processing_status === "deleting"
@@ -69,11 +90,19 @@ Deno.serve(async (request) => {
         .maybeSingle();
 
       if (claimError) {
-        throw new Error(`Could not begin document deletion: ${claimError.message}`);
+        return fail(
+          "Document deletion could not be started. Please retry.",
+          500,
+          "database_failure",
+        );
       }
 
       if (!claimedDocument) {
-        return jsonResponse({ error: "The document changed while deletion was starting. Refresh and try again." }, 409);
+        return fail(
+          "The document changed while deletion was starting. Refresh and try again.",
+          409,
+          "conflict",
+        );
       }
     }
 
@@ -91,16 +120,21 @@ Deno.serve(async (request) => {
           .eq("processing_status", "deleting");
 
         if (restoreError) {
-          console.error("Could not restore document status after Storage deletion failed", {
-            documentId,
-            error: restoreError.message,
+          logOperational("error", {
+            requestId,
+            stage: "delete-document-restore-status",
+            httpStatus: 500,
+            reasonCode: "database_failure",
+            durationMs: Date.now() - startedAt,
           });
         }
       }
 
-      return jsonResponse({
-        error: `The private file could not be deleted. The document was kept: ${storageError.message}`,
-      }, 502);
+      return fail(
+        "The private file could not be deleted. The document record was kept so you can retry safely.",
+        502,
+        "storage_failure",
+      );
     }
 
     const { data: deletedDocument, error: deleteError } = await supabase
@@ -113,29 +147,42 @@ Deno.serve(async (request) => {
       .maybeSingle();
 
     if (deleteError) {
-      console.error("Storage object was deleted but the document row could not be removed", {
-        documentId,
-        error: deleteError.message,
-      });
-      return jsonResponse({
-        error: "The private file was deleted, but its document record could not be removed. Please retry deletion.",
-      }, 500);
+      return fail(
+        "The private file was deleted, but its document record could not be removed. Please retry deletion.",
+        500,
+        "database_failure",
+      );
     }
 
     // A concurrent retry may have deleted the same row after both requests removed
     // the same private object. Treat that idempotent outcome as success.
     if (!deletedDocument) {
-      console.info("Document row was already removed by a concurrent deletion", { documentId });
+      logOperational("info", {
+        requestId,
+        stage: "delete-document-idempotent-retry",
+        httpStatus: 200,
+        reasonCode: "none",
+        durationMs: Date.now() - startedAt,
+      });
     }
 
-    return jsonResponse({ documentId, deleted: true });
+    logOperational("info", {
+      requestId,
+      stage: "delete-document-complete",
+      httpStatus: 200,
+      reasonCode: "none",
+      durationMs: Date.now() - startedAt,
+    });
+    return respond({ documentId, deleted: true });
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.message }, error.status);
+      return fail(error.message, error.status, error.reasonCode);
     }
 
-    const message = error instanceof Error ? error.message : "Unexpected document deletion error.";
-    console.error("delete-document failed", message);
-    return jsonResponse({ error: message }, 500);
+    return fail(
+      "Document deletion failed unexpectedly. Please retry.",
+      500,
+      "internal_failure",
+    );
   }
 });
