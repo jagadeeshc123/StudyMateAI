@@ -4,6 +4,7 @@ import { FileText, MessageSquare, Pencil, RefreshCw, Sparkles, Trash2 } from "lu
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 import { removeFromActiveBatch, setActiveBatch } from "@/integrations/supabase/active-batch";
+import { removeDocumentFromActiveSession } from "@/integrations/supabase/active-session";
 import Navbar from "@/components/Navbar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -133,6 +134,7 @@ const Documents = () => {
     try {
       await deleteDocument(target.id);
       if (user) removeFromActiveBatch(user.id, target.id);
+      if (user) removeDocumentFromActiveSession(user.id, target.id);
       setDocuments((current) => current.filter((document) => document.id !== target.id));
       toast.success("Document and its private file were deleted.");
     } catch (error) {

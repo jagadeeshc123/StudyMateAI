@@ -2,6 +2,8 @@ import { invokeEdgeFunction } from "@/integrations/supabase/edge-functions";
 
 export interface SourceCitation {
   chunkId?: string;
+  documentId?: string;
+  documentName?: string;
   pageNumber: number;
   excerpt: string;
   fullExcerpt?: string;
@@ -17,7 +19,10 @@ export interface ChatAnswer {
 
 export interface PersistedMessage {
   id: string;
-  document_id: string;
+  document_id: string | null;
+  chat_session_id?: string;
+  retrieval_mode?: string;
+  selected_document_count?: number;
   role: "user" | "assistant";
   content: string;
   created_at: string;

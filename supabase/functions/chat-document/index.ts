@@ -38,8 +38,7 @@ import {
   buildPlainChunkContext,
   buildPlainSectionContext,
   citationsFromIds,
-  selectRepresentativeCitationIds,
-  selectStrongestCitationIds,
+  selectAnswerSupportingCitationIds,
   type SourceCitation,
 } from "./document-sources.ts";
 import {
@@ -650,13 +649,17 @@ Deno.serve(async (request) => {
         requestId,
       );
       const sources = citationsFromIds(
-        selectRepresentativeCitationIds(summary.chunks, responseMode),
+        selectAnswerSupportingCitationIds(
+          summary.answer,
+          summary.chunks,
+          responseMode,
+        ),
         summary.chunks,
         question,
         RESPONSE_MODES[responseMode].maxSources,
       );
       const answerFound = summary.chunks.length > 0 &&
-        summary.answer.trim().length > 0;
+        summary.answer.trim().length > 0 && sources.length > 0;
       const answer = answerFound ? summary.answer.trim() : NOT_FOUND_ANSWER;
       const safeSources = answerFound ? sources : [];
 
@@ -844,7 +847,11 @@ Deno.serve(async (request) => {
     );
 
     const sources = citationsFromIds(
-      selectStrongestCitationIds(retrievedChunks, responseMode),
+      selectAnswerSupportingCitationIds(
+        generatedAnswer,
+        retrievedChunks,
+        responseMode,
+      ),
       retrievedChunks,
       question,
       RESPONSE_MODES[responseMode].maxSources,

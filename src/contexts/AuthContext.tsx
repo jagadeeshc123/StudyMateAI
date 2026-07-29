@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import type { Session, User } from "@supabase/supabase-js";
 import { supabase } from "@/integrations/supabase/client";
 import { clearAllActiveBatches } from "@/integrations/supabase/active-batch";
+import { clearAllActiveSessions } from "@/integrations/supabase/active-session";
 
 interface AuthContextValue {
   session: Session | null;
@@ -35,6 +36,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (sessionError) {
         queryClient.clear();
         clearAllActiveBatches();
+        clearAllActiveSessions();
         currentUserId.current = null;
         setSession(null);
         setError(`Could not restore your session: ${sessionError.message}`);
@@ -43,6 +45,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         queryClient.clear();
         if (currentUserId.current !== undefined && currentUserId.current !== nextUserId) {
           clearAllActiveBatches();
+          clearAllActiveSessions();
         }
         currentUserId.current = nextUserId;
         setSession(data.session);
@@ -60,6 +63,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       queryClient.clear();
       if (currentUserId.current !== undefined && currentUserId.current !== nextUserId) {
         clearAllActiveBatches();
+        clearAllActiveSessions();
       }
       currentUserId.current = nextUserId;
       setSession(nextSession);
@@ -82,6 +86,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setError(null);
       queryClient.clear();
       clearAllActiveBatches();
+      clearAllActiveSessions();
       currentUserId.current = null;
       setSession(null);
       const { error: signOutError } = await supabase.auth.signOut();

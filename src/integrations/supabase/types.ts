@@ -14,6 +14,77 @@ export type Database = {
   }
   public: {
     Tables: {
+      chat_session_documents: {
+        Row: {
+          added_at: string
+          document_id: string
+          position: number
+          session_id: string
+        }
+        Insert: {
+          added_at?: string
+          document_id: string
+          position: number
+          session_id: string
+        }
+        Update: {
+          added_at?: string
+          document_id?: string
+          position?: number
+          session_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "chat_session_documents_document_id_fkey"
+            columns: ["document_id"]
+            isOneToOne: false
+            referencedRelation: "documents"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "chat_session_documents_session_id_fkey"
+            columns: ["session_id"]
+            isOneToOne: false
+            referencedRelation: "chat_sessions"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      chat_sessions: {
+        Row: {
+          created_at: string
+          id: string
+          mode: string
+          title: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          mode?: string
+          title: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          mode?: string
+          title?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "chat_sessions_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       documents: {
         Row: {
           created_at: string
@@ -119,27 +190,43 @@ export type Database = {
       }
       messages: {
         Row: {
+          chat_session_id: string
           content: string
           created_at: string
-          document_id: string
+          document_id: string | null
           id: string
+          retrieval_mode: string
           role: string
+          selected_document_count: number
         }
         Insert: {
+          chat_session_id?: string
           content: string
           created_at?: string
-          document_id: string
+          document_id?: string | null
           id?: string
+          retrieval_mode?: string
           role: string
+          selected_document_count?: number
         }
         Update: {
+          chat_session_id?: string
           content?: string
           created_at?: string
-          document_id?: string
+          document_id?: string | null
           id?: string
+          retrieval_mode?: string
           role?: string
+          selected_document_count?: number
         }
         Relationships: [
+          {
+            foreignKeyName: "messages_chat_session_id_fkey"
+            columns: ["chat_session_id"]
+            isOneToOne: false
+            referencedRelation: "chat_sessions"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "messages_document_id_fkey"
             columns: ["document_id"]
@@ -223,6 +310,29 @@ export type Database = {
           document_id: string
           id: string
           keyword_score: number | null
+          page_number: number
+          semantic_score: number | null
+        }[]
+      }
+      hybrid_search_multi_document_chunks: {
+        Args: {
+          keyword_query: string
+          per_document_count?: number
+          query_embedding: string | null
+          requested_page_numbers?: number[] | null
+          target_document_ids: string[]
+          target_embedding_model?: string
+        }
+        Returns: {
+          chunk_index: number
+          combined_score: number | null
+          content: string
+          display_name: string | null
+          document_id: string
+          document_position: number
+          id: string
+          keyword_score: number | null
+          original_file_name: string
           page_number: number
           semantic_score: number | null
         }[]

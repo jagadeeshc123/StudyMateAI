@@ -14,6 +14,23 @@ interface LoginLocationState {
   sessionError?: string;
 }
 
+const AUTHENTICATED_DESTINATIONS = new Set([
+  "/upload",
+  "/documents",
+  "/chat",
+  "/history",
+]);
+
+function safePostLoginDestination(state: LoginLocationState | null): string {
+  const pathname = state?.from?.pathname;
+
+  if (!pathname || !AUTHENTICATED_DESTINATIONS.has(pathname)) {
+    return "/upload";
+  }
+
+  return `${pathname}${state.from?.search ?? ""}${state.from?.hash ?? ""}`;
+}
+
 const Login = () => {
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [email, setEmail] = useState("");
@@ -25,9 +42,7 @@ const Login = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const state = location.state as LoginLocationState | null;
-  const destination = state?.from?.pathname
-    ? `${state.from.pathname}${state.from.search}${state.from.hash}`
-    : "/upload";
+  const destination = safePostLoginDestination(state);
 
   useEffect(() => {
     if (state?.sessionError) setFormError(state.sessionError);

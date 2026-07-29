@@ -34,6 +34,128 @@ function uniquePageChunks(chunks: SourceChunk[]): SourceChunk[] {
   });
 }
 
+const SUPPORT_STOP_WORDS = new Set([
+  "about",
+  "after",
+  "also",
+  "answer",
+  "because",
+  "before",
+  "being",
+  "between",
+  "could",
+  "document",
+  "does",
+  "from",
+  "have",
+  "into",
+  "only",
+  "other",
+  "selected",
+  "source",
+  "such",
+  "than",
+  "that",
+  "their",
+  "there",
+  "these",
+  "they",
+  "this",
+  "through",
+  "using",
+  "were",
+  "which",
+  "while",
+  "with",
+  "would",
+]);
+
+function supportTokens(value: string): Set<string> {
+  return new Set(
+    value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu)?.filter((token) =>
+      (token.length > 2 || /^\d+$/.test(token)) &&
+      !SUPPORT_STOP_WORDS.has(token)
+    ) ?? [],
+  );
+}
+
+function answerClaims(answer: string): Set<string>[] {
+  return answer
+    .split(/(?<=[.!?])\s+|\n+/u)
+    .map((claim) => supportTokens(claim))
+    .filter((tokens) => tokens.size >= 2);
+}
+
+function claimSupportScore(
+  claimTokens: Set<string>,
+  chunkTokens: Set<string>,
+): number {
+  let sharedTokens = 0;
+
+  for (const token of claimTokens) {
+    if (chunkTokens.has(token)) sharedTokens += 1;
+  }
+
+  if (sharedTokens < 2) return 0;
+  const claimCoverage = sharedTokens / claimTokens.size;
+  return claimCoverage >= 0.5 ? sharedTokens + claimCoverage : 0;
+}
+
+/**
+ * Select only database chunks that materially support the generated answer.
+ * Every substantive answer claim must match a retrieved chunk; otherwise the
+ * answer is rejected by returning no citation IDs. This deliberately favors a
+ * safe not-found response over attaching a merely related citation.
+ */
+export function selectAnswerSupportingCitationIds(
+  answer: string,
+  chunks: SourceChunk[],
+  mode: ResponseMode,
+): string[] {
+  const claims = answerClaims(answer);
+  if (claims.length === 0 || chunks.length === 0) return [];
+
+  const chunkTokens = chunks.map((chunk) => supportTokens(chunk.content));
+  const supportingIds: string[] = [];
+
+  for (const claim of claims) {
+    let bestIndex = -1;
+    let bestScore = 0;
+
+    for (let index = 0; index < chunks.length; index += 1) {
+      const score = claimSupportScore(claim, chunkTokens[index]);
+      if (score > bestScore) {
+        bestIndex = index;
+        bestScore = score;
+      }
+    }
+
+    if (bestIndex < 0) return [];
+    supportingIds.push(chunks[bestIndex].id);
+  }
+
+  const limit = mode === "concise" ? 3 : mode === "balanced" ? 6 : 8;
+  const uniqueIds = [...new Set(supportingIds)];
+  const selected: string[] = [];
+  const seenPages = new Set<number>();
+
+  for (const id of uniqueIds) {
+    const chunk = chunks.find((candidate) => candidate.id === id);
+    if (!chunk || seenPages.has(chunk.page_number)) continue;
+    selected.push(id);
+    seenPages.add(chunk.page_number);
+    if (selected.length === limit) return selected;
+  }
+
+  for (const id of uniqueIds) {
+    if (selected.includes(id)) continue;
+    selected.push(id);
+    if (selected.length === limit) break;
+  }
+
+  return selected;
+}
+
 export function selectStrongestCitationIds(
   chunks: SourceChunk[],
   mode: ResponseMode,

@@ -25,6 +25,7 @@ export interface SafeOperationalLog {
   httpStatus: number;
   reasonCode: SafeReasonCode | "none";
   model?: string;
+  documentCount?: number;
   chunkCount?: number;
   durationMs?: number;
 }

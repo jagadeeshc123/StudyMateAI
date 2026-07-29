@@ -24,7 +24,7 @@ Only use the browser-safe publishable/anonymous key. Never put a Supabase servic
 
 ## Database and private Storage setup
 
-The version-controlled migrations create the private `documents` bucket, the application tables, authenticated ownership policies, pgvector embedding storage, and server-only keyword/hybrid search functions.
+The version-controlled migrations create the private `documents` bucket, the application tables, authenticated ownership policies, normalized chat sessions, pgvector embedding storage, and server-only single- and multi-document hybrid search functions.
 
 Link the Supabase CLI and apply all migrations:
 
@@ -42,6 +42,7 @@ Alternatively, run these files in timestamp order using **Supabase Dashboard -> 
 5. `supabase/migrations/20260727160000_phase1_security_hardening.sql`
 6. `supabase/migrations/20260729120000_phase2_pgvector_hybrid_search.sql`
 7. `supabase/migrations/20260730120000_phase2_5_integrity_hardening.sql`
+8. `supabase/migrations/20260730180000_phase3_multi_document_sessions.sql`
 
 In **Supabase Dashboard -> Storage**, confirm the `documents` bucket exists and **Public bucket** is disabled. The first migration creates and configures it automatically when run as written.
 
@@ -72,6 +73,7 @@ Deploy all functions after applying the database migrations:
 npx supabase functions deploy process-document --project-ref "$PROJECT_REF"
 npx supabase functions deploy chat-document --project-ref "$PROJECT_REF"
 npx supabase functions deploy delete-document --project-ref "$PROJECT_REF"
+npx supabase functions deploy chat-session --project-ref "$PROJECT_REF"
 ```
 
 JWT verification remains enabled. The frontend explicitly sends the current user's access token, and each function calls `auth.getUser()`, checks document ownership, and only then performs service-role operations.
@@ -98,14 +100,15 @@ npm run preview
 
 ```sh
 npx tsc -p tsconfig.app.json --noEmit
-npx -y deno check --config supabase/functions/deno.json supabase/functions/process-document/index.ts supabase/functions/chat-document/index.ts supabase/functions/delete-document/index.ts
-npx -y deno test --allow-env supabase/functions
+npx -y deno check --config supabase/functions/deno.json supabase/functions/process-document/index.ts supabase/functions/chat-document/index.ts supabase/functions/chat-session/index.ts supabase/functions/delete-document/index.ts
+npx -y deno test --config supabase/functions/deno.json --allow-env supabase/functions
 npm run build
 npm run lint
 npx supabase db reset
 npx supabase db lint --local
 npx supabase test db supabase/tests/ownership_rls.sql
 npx supabase test db supabase/tests/phase2_hybrid_search.sql
+npx supabase test db supabase/tests/phase3_multi_document.sql
 git diff --check
 ```
 
@@ -118,15 +121,15 @@ The SQL test checks cross-user RLS for documents, chunks, messages, document sta
 3. The browser invokes `process-document` with the access token and waits before opening Chat.
 4. The Edge Function authenticates the caller, verifies ownership, downloads the private PDF, extracts per-page text, stores chunks, and marks extraction `ready` before attempting free-tier semantic indexing. Embedding failures never disable keyword chat.
 5. Documents lists owner-scoped extraction and semantic-search status, errors, and statistics in one request. Owners can retry semantic backfill for one ready document; rename changes only the display name, and deletion runs through the authenticated `delete-document` function.
-6. History groups saved Q&A by owned document and uses an authenticated owner-scoped SQL function for clearing one document or all history without deleting PDFs.
-7. Chat intersects the current user's ready documents with the user-scoped latest-upload batch, persists that batch across refresh, and replaces it when **Open in Chat** is used from Documents or History.
-8. The answer-depth selector sends a server-clamped `concise`, `balanced`, or `detailed` mode. Ordinary and page-specific questions use bounded pgvector/full-text reciprocal-rank fusion with automatic keyword fallback; complete-document intents keep ordered all-chunk or hierarchical summarization. Citations remain derived from retrieved database chunks and provide expandable database excerpts.
+6. History lists owner-scoped normalized sessions, their mode and selected document names, and saved Q&A. Sessions can be reopened, renamed, or deleted without deleting PDFs.
+7. Chat supports single-document, multi-document, and comparison modes with one to five server-revalidated ready documents. Active session UUIDs and selections are user-keyed in session storage and never contain document text.
+8. Multi-document retrieval generates at most one query embedding, searches each selected document independently, merges candidates fairly by document and page, and falls back to keyword retrieval when semantic indexing is unavailable.
+9. Complete multi-document summaries traverse each document in order before cross-document synthesis. Citations are server-selected only when retrieved database chunks materially support the generated answer, and include database-derived document identity, page, and expandable excerpts.
 
 ## MVP limitations
 
 - Image-only/scanned PDFs are rejected because OCR is not implemented.
 - Semantic retrieval depends on Gemini Free Tier embedding availability; keyword retrieval remains available when embeddings are pending or failed.
-- One selected document is queried at a time.
 - There is no password-reset UI, rate limiting, browser E2E test suite, or background job queue.
 - PDF processing runs synchronously within Edge Function runtime limits; very complex 20 MB PDFs may need a queued worker later.
 
