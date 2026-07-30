@@ -19,8 +19,9 @@ export interface ProcessDocumentResult {
   status: "ready";
   pageCount?: number;
   chunkCount?: number;
+  recoveredStaleLease?: boolean;
   embedding: {
-    status: "ready" | "failed" | "skipped";
+    status: "ready" | "failed" | "skipped" | "pending";
     totalChunks: number;
     embeddedChunks: number;
     skippedChunks: number;
@@ -112,40 +113,28 @@ export async function uploadDocument(file: File): Promise<DocumentRecord> {
     });
 
   if (storageError) {
-    throw new DocumentStorageError(`Could not upload ${file.name}: ${storageError.message}`);
+    throw new DocumentStorageError(`Could not upload ${file.name}. Please retry.`);
   }
 
-  const documentToInsert: Database["public"]["Tables"]["documents"]["Insert"] = {
-    id: documentId,
-    user_id: user.id,
-    original_file_name: file.name,
-    storage_path: storagePath,
-    file_size: file.size,
-    mime_type: PDF_MIME_TYPE,
-    processing_status: "uploaded",
-  };
-
-  const { data: document, error: databaseError } = await supabase
-    .from("documents")
-    .insert(documentToInsert)
-    .select()
-    .single();
-
-  if (databaseError) {
+  try {
+    const response = await invokeEdgeFunction<{ document: DocumentRecord }>(
+      "register-document",
+      { documentId, originalFileName: file.name },
+    );
+    return response.document;
+  } catch (registrationError) {
     const { error: cleanupError } = await supabase.storage
       .from(DOCUMENTS_BUCKET)
       .remove([storagePath]);
 
     const cleanupMessage = cleanupError
-      ? ` Automatic cleanup also failed: ${cleanupError.message}`
+      ? " Automatic cleanup also failed; remove the unregistered upload before retrying."
       : " The uploaded file was removed automatically.";
 
     throw new DocumentStorageError(
-      `The file uploaded, but its document record could not be created: ${databaseError.message}.${cleanupMessage}`,
+      `${registrationError instanceof Error ? registrationError.message : "The uploaded file could not be registered."}${cleanupMessage}`,
     );
   }
-
-  return document;
 }
 
 export async function listDocuments(): Promise<DocumentSummary[]> {
@@ -164,7 +153,7 @@ export async function listManagedDocuments(): Promise<ManagedDocument[]> {
   const { data, error } = await supabase.rpc("list_user_documents");
 
   if (error) {
-    throw new DocumentStorageError(`Could not load uploaded documents: ${error.message}`);
+    throw new DocumentStorageError("Could not load uploaded documents. Please retry.");
   }
 
   return data ?? [];
@@ -193,7 +182,7 @@ export async function renameDocument(documentId: string, displayName: string): P
     .maybeSingle();
 
   if (error) {
-    throw new DocumentStorageError(`Could not rename the document: ${error.message}`);
+    throw new DocumentStorageError("Could not rename the document. Please retry.");
   }
 
   if (!data) {

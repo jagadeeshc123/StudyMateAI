@@ -46,6 +46,7 @@ import {
   requestGeminiText,
 } from "../chat-document/gemini-generate-content.ts";
 import { citationsFromIds } from "../chat-document/document-sources.ts";
+import { enforceRateLimit } from "../_shared/rate-limit.ts";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -364,7 +365,12 @@ function throwGeminiHttpError(error: unknown): never {
   };
   const [status, reason] = mappings[error.code] ??
     [502, "provider_unavailable"];
-  throw new HttpError(status, error.message, reason);
+  throw new HttpError(
+    status,
+    error.message,
+    reason,
+    error.code === "quota" ? 60 : undefined,
+  );
 }
 
 async function generateText(
@@ -375,8 +381,10 @@ async function generateText(
   requestId: string,
   stage: "intermediate" | "final" = "final",
 ): Promise<string> {
+  const providerStartedAt = Date.now();
+  let succeeded = false;
   try {
-    return await requestGeminiText({
+    const answer = await requestGeminiText({
       requestId,
       model: Deno.env.get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
       apiKey: requiredServerSecret("GEMINI_API_KEY"),
@@ -389,8 +397,22 @@ async function generateText(
         ? INTERMEDIATE_SUMMARY_OUTPUT_TOKENS
         : RESPONSE_MODES[mode].maxOutputTokens,
     });
+    succeeded = true;
+    return answer;
   } catch (error) {
-    throwGeminiHttpError(error);
+    return throwGeminiHttpError(error);
+  } finally {
+    logOperational(succeeded ? "info" : "warn", {
+      requestId,
+      functionName: "chat-session",
+      operationType: stage === "intermediate" ? "summary" : "answer",
+      stage: `chat-session-${stage}-provider`,
+      httpStatus: succeeded ? 200 : 0,
+      reasonCode: succeeded ? "none" : "provider_unavailable",
+      model: Deno.env.get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
+      contextCharacterCount: context.length,
+      providerDurationMs: Date.now() - providerStartedAt,
+    });
   }
 }
 
@@ -653,22 +675,19 @@ async function saveConversation(
   question: string,
   answer: string,
   sources: SourceCitation[],
+  requestId: string,
 ): Promise<void> {
   const admin = createSupabaseAdminClient();
-  const shared = {
-    document_id: documents[0]?.id ?? null,
-    chat_session_id: session.id,
-    retrieval_mode: session.mode,
-    selected_document_count: documents.length,
-  };
-  const { error } = await admin.from("messages").insert([
-    { ...shared, role: "user", content: question },
-    {
-      ...shared,
-      role: "assistant",
-      content: JSON.stringify({ answer, sources }),
-    },
-  ]);
+  const { error } = await admin.rpc("persist_chat_message_pair", {
+    target_user_id: session.user_id,
+    target_session_id: session.id,
+    target_document_id: documents[0]?.id ?? null,
+    target_retrieval_mode: session.mode,
+    target_document_count: documents.length,
+    target_request_id: requestId,
+    user_content: question,
+    assistant_content: JSON.stringify({ answer, sources }),
+  });
   if (error) {
     throw new HttpError(
       500,
@@ -758,23 +777,35 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: "Only POST requests are supported." }, 405);
   }
 
-  const requestId = createRequestId();
+  const requestId = createRequestId(request.headers.get("x-request-id"));
   const startedAt = Date.now();
-  const respond = (body: Record<string, unknown>, status = 200) =>
-    requestJsonResponse(requestId, body, status);
+  const respond = (
+    body: Record<string, unknown>,
+    status = 200,
+    retryAfter?: number,
+  ) =>
+    requestJsonResponse(
+      requestId,
+      { ...body, ...(retryAfter ? { retryAfter } : {}) },
+      status,
+      retryAfter ? { "Retry-After": String(retryAfter) } : {},
+    );
   const fail = (
     message: string,
     status: number,
     reasonCode: SafeReasonCode,
+    retryAfter?: number,
   ) => {
     logOperational(status >= 500 ? "error" : "warn", {
       requestId,
       stage: "chat-session",
       httpStatus: status,
       reasonCode,
+      requestCount: 1,
+      failureCount: 1,
       durationMs: Date.now() - startedAt,
     });
-    return respond({ error: message }, status);
+    return respond({ error: message }, status, retryAfter);
   };
 
   try {
@@ -794,6 +825,7 @@ Deno.serve(async (request) => {
     const action = typeof body.action === "string" ? body.action : "ask";
 
     if (action === "create") {
+      await enforceRateLimit(user.id, "session_create", requestId);
       const documentIds = normalizeDocumentIds(body.documentIds);
       const mode = normalizeMode(body.mode);
       if (mode === "single_document" && documentIds.length !== 1) {
@@ -937,6 +969,7 @@ Deno.serve(async (request) => {
         "invalid_request",
       );
     }
+    await enforceRateLimit(user.id, "chat", requestId);
     const responseMode = normalizeResponseMode(body.response_mode);
     const intent = classifyMultiDocumentIntent(question, loaded.session.mode);
     let requestedPages: number[];
@@ -1026,6 +1059,7 @@ Deno.serve(async (request) => {
           question,
           answer,
           [],
+          requestId,
         );
         return respond({ answer, sources: [], notFound: true });
       }
@@ -1034,6 +1068,7 @@ Deno.serve(async (request) => {
     let answerText: string;
     let evidence: MultiDocumentChunk[];
     if (isCompleteMultiDocumentIntent(intent)) {
+      await enforceRateLimit(user.id, "complete_summary", requestId);
       const summary = await generateCompleteMultiSummary(
         targetDocuments,
         question,
@@ -1044,6 +1079,7 @@ Deno.serve(async (request) => {
       answerText = summary.answer.trim();
       evidence = summary.chunks;
     } else {
+      const retrievalStartedAt = Date.now();
       const candidates = await retrieveChunks(
         targetDocuments,
         question,
@@ -1054,6 +1090,17 @@ Deno.serve(async (request) => {
         candidates,
         MAX_RETRIEVED_CHUNKS,
       );
+      logOperational("info", {
+        requestId,
+        functionName: "chat-session",
+        operationType: "retrieval",
+        stage: "chat-session-retrieval",
+        httpStatus: 200,
+        reasonCode: "none",
+        documentCount: targetDocuments.length,
+        chunkCount: evidence.length,
+        retrievalDurationMs: Date.now() - retrievalStartedAt,
+      });
       const bounded = buildMultiDocumentContext(
         evidence,
         MAX_CONTEXT_CHARACTERS,
@@ -1066,6 +1113,7 @@ Deno.serve(async (request) => {
           question,
           NOT_FOUND_ANSWER,
           [],
+          requestId,
         );
         return respond({
           answer: NOT_FOUND_ANSWER,
@@ -1120,12 +1168,15 @@ Deno.serve(async (request) => {
       question,
       answer,
       safeSources,
+      requestId,
     );
     logOperational("info", {
       requestId,
       stage: "chat-session-complete",
       httpStatus: 200,
       reasonCode: "none",
+      requestCount: 1,
+      successCount: 1,
       documentCount: loaded.documents.length,
       chunkCount: evidence.length,
       durationMs: Date.now() - startedAt,
@@ -1133,7 +1184,12 @@ Deno.serve(async (request) => {
     return respond({ answer, sources: safeSources, notFound: !answerFound });
   } catch (error) {
     if (error instanceof HttpError) {
-      return fail(error.message, error.status, error.reasonCode);
+      return fail(
+        error.message,
+        error.status,
+        error.reasonCode,
+        error.retryAfterSeconds,
+      );
     }
     return fail(
       "The chat session request failed unexpectedly. Please retry.",

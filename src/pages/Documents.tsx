@@ -147,7 +147,13 @@ const Documents = () => {
   };
 
   const retryProcessing = async (document: ManagedDocument) => {
-    if (retryingId || deletingId || renaming || embeddingId || !["failed", "uploaded"].includes(document.processing_status)) return;
+    const staleProcessing = document.processing_status === "processing" &&
+      Boolean(document.processing_started_at) &&
+      Date.now() - new Date(document.processing_started_at ?? 0).getTime() >= 15 * 60_000;
+    if (
+      retryingId || deletingId || renaming || embeddingId ||
+      (!["failed", "uploaded"].includes(document.processing_status) && !staleProcessing)
+    ) return;
 
     setRetryingId(document.id);
     setDocuments((current) => current.map((item) =>
@@ -157,8 +163,12 @@ const Documents = () => {
     ));
 
     try {
-      await processDocument(document.id);
-      toast.success("Document processing completed.");
+      const result = await processDocument(document.id);
+      toast.success(
+        result.recoveredStaleLease
+          ? `Stale processing was recovered and completed. Request ID: ${result.requestId}`
+          : "Document processing completed.",
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Document processing failed.");
     } finally {
@@ -227,7 +237,10 @@ const Documents = () => {
             <div className="space-y-4">
               {documents.map((document) => {
                 const status = document.id === deletingId ? "deleting" : document.processing_status;
-                const retryable = status === "failed" || status === "uploaded";
+                const staleProcessing = status === "processing" &&
+                  Boolean(document.processing_started_at) &&
+                  Date.now() - new Date(document.processing_started_at ?? 0).getTime() >= 15 * 60_000;
+                const retryable = status === "failed" || status === "uploaded" || staleProcessing;
                 const operationBusy = document.id === deletingId ||
                   document.id === retryingId || document.id === embeddingId ||
                   renaming || Boolean(deletingId || retryingId || embeddingId);
@@ -259,8 +272,12 @@ const Documents = () => {
                         <div><dt className="text-muted-foreground">Messages</dt><dd className="font-medium">{document.message_count}</dd></div>
                         <div>
                           <dt className="text-muted-foreground">Semantic search</dt>
-                          <dd className="font-medium capitalize">
-                            {document.embedding_status} ({document.embedded_chunk_count}/{document.chunk_count})
+                          <dd className="font-medium">
+                            {document.embedding_status === "ready"
+                              ? "Ready"
+                              : document.embedding_status === "failed"
+                              ? "Unavailable â€” keyword search active"
+                              : "Semantic indexing"} ({document.embedded_chunk_count}/{document.chunk_count})
                           </dd>
                         </div>
                       </dl>
@@ -293,7 +310,11 @@ const Documents = () => {
                         {retryable && (
                           <Button size="sm" variant="outline" onClick={() => void retryProcessing(document)} disabled={operationBusy}>
                             <RefreshCw className="mr-2 h-4 w-4" />
-                            {document.id === retryingId ? "Processing..." : "Retry Processing"}
+                            {document.id === retryingId
+                              ? "Processing..."
+                              : staleProcessing
+                              ? "Recover Processing"
+                              : "Retry Processing"}
                           </Button>
                         )}
                         {status === "ready" && document.embedding_status !== "ready" && (

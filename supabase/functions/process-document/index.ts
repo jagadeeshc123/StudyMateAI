@@ -14,14 +14,20 @@ import {
   type SafeReasonCode,
 } from "../_shared/request-context.ts";
 import { chunkExtractedPages } from "../_shared/text.ts";
+import { enforceRateLimit } from "../_shared/rate-limit.ts";
+import { verifyOwnedPdfObject } from "../_shared/storage-object.ts";
 import {
   type DocumentEmbeddingResult,
   embedDocumentChunks,
+  pendingDocumentEmbeddingResult,
 } from "./document-embeddings.ts";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const INSERT_BATCH_SIZE = 250;
+const MAX_PDF_PAGES = 500;
+const MAX_EXTRACTED_CHARACTERS = 2_000_000;
+const MAX_DOCUMENT_CHUNKS = 2_500;
+const PROCESSING_LEASE_SECONDS = 15 * 60;
 
 interface ProcessDocumentBody {
   documentId?: unknown;
@@ -151,33 +157,48 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: "Only POST requests are supported." }, 405);
   }
 
-  const requestId = createRequestId();
+  const requestId = createRequestId(request.headers.get("x-request-id"));
   const startedAt = Date.now();
-  const respond = (body: Record<string, unknown>, status = 200) =>
-    requestJsonResponse(requestId, body, status);
+  const respond = (
+    body: Record<string, unknown>,
+    status = 200,
+    retryAfter?: number,
+  ) =>
+    requestJsonResponse(
+      requestId,
+      { ...body, ...(retryAfter ? { retryAfter } : {}) },
+      status,
+      retryAfter ? { "Retry-After": String(retryAfter) } : {},
+    );
   const fail = (
     message: string,
     status: number,
     reasonCode: SafeReasonCode,
+    retryAfter?: number,
   ) => {
     logOperational(status >= 500 ? "error" : "warn", {
       requestId,
       stage: "process-document",
       httpStatus: status,
       reasonCode,
+      requestCount: 1,
+      failureCount: 1,
       durationMs: Date.now() - startedAt,
     });
-    return respond({ error: message }, status);
+    return respond({ error: message }, status, retryAfter);
   };
 
   let supabase: ReturnType<typeof createSupabaseAdminClient> | null = null;
   let documentId: string | null = null;
-  let documentExists = false;
+  let userId: string | null = null;
+  let processingLeaseId: string | null = null;
+  let recoveredStaleLease = false;
 
   try {
     const { user, supabase: callerSupabase } = await requireAuthenticatedUser(
       request,
     );
+    userId = user.id;
     const body = (await request.json()) as ProcessDocumentBody;
     documentId = typeof body.documentId === "string" ? body.documentId : null;
     const action = body.action === "backfill_embeddings"
@@ -191,7 +212,7 @@ Deno.serve(async (request) => {
     const { data: document, error: documentError } = await callerSupabase
       .from("documents")
       .select(
-        "id, user_id, storage_path, mime_type, processing_status, display_name, original_file_name",
+        "id, user_id, storage_path, file_size, mime_type, processing_status, display_name, original_file_name",
       )
       .eq("id", documentId)
       .eq("user_id", user.id)
@@ -209,11 +230,11 @@ Deno.serve(async (request) => {
       return fail("Document not found or unavailable.", 404, "not_found");
     }
 
-    documentExists = true;
     const documentTitle = document.display_name?.trim() ||
       document.original_file_name?.trim() || null;
 
     if (action === "backfill_embeddings") {
+      await enforceRateLimit(user.id, "embedding_backfill", requestId);
       if (document.processing_status !== "ready") {
         return fail(
           "Embeddings can only be created after PDF text extraction is ready.",
@@ -246,66 +267,104 @@ Deno.serve(async (request) => {
       });
     }
 
+    await enforceRateLimit(user.id, "process_document", requestId);
+
     if (document.mime_type !== "application/pdf") {
       throw new Error("The stored document is not a PDF.");
     }
 
+    supabase = createSupabaseAdminClient();
+    const verifiedObject = await verifyOwnedPdfObject(user.id, documentId);
     if (
-      document.processing_status !== "uploaded" &&
-      document.processing_status !== "failed"
+      !verifiedObject || verifiedObject.path !== document.storage_path ||
+      verifiedObject.size !== document.file_size ||
+      verifiedObject.mimeType !== document.mime_type
     ) {
       return fail(
-        document.processing_status === "processing"
-          ? "This document is already processing."
-          : "This document is not in a retryable processing state.",
-        409,
-        "conflict",
+        "The registered PDF is missing or does not match its verified upload. Upload it again.",
+        422,
+        "storage_failure",
       );
     }
 
-    supabase = createSupabaseAdminClient();
-    const { data: claimedDocument, error: processingStatusError } =
-      await supabase
-        .from("documents")
-        .update({
-          processing_status: "processing",
-          processing_error: null,
-          page_count: null,
-        })
-        .eq("id", documentId)
-        .eq("user_id", user.id)
-        .in("processing_status", ["uploaded", "failed"])
-        .select("id")
-        .maybeSingle();
-
+    processingLeaseId = crypto.randomUUID();
+    const { data: claimRows, error: processingStatusError } = await supabase
+      .rpc(
+        "claim_document_processing",
+        {
+          target_document_id: documentId,
+          target_user_id: user.id,
+          requested_lease_id: processingLeaseId,
+          stale_after_seconds: PROCESSING_LEASE_SECONDS,
+          maximum_active_jobs: 2,
+          retry_delay_seconds: 60,
+        },
+      );
     if (processingStatusError) {
-      throw new Error(
-        `Could not mark the document as processing: ${processingStatusError.message}`,
+      throw new Error("Could not claim document processing safely.");
+    }
+    const claim = (claimRows as
+      | Array<{
+        claim_status: string;
+        recovered_stale_lease: boolean;
+        retry_after_seconds: number;
+      }>
+      | null)?.[0];
+    if (!claim || claim.claim_status === "not_found") {
+      processingLeaseId = null;
+      return fail("Document not found or unavailable.", 404, "not_found");
+    }
+    if (claim.claim_status === "active") {
+      processingLeaseId = null;
+      return fail(
+        "This document is already being processed. Please wait before retrying.",
+        409,
+        "processing_active",
+        claim.retry_after_seconds,
       );
     }
-
-    if (!claimedDocument) {
+    if (claim.claim_status === "retry_later") {
+      processingLeaseId = null;
       return fail(
-        "This document is already processing or is no longer retryable.",
+        "Please wait before retrying this document.",
+        429,
+        "rate_limited",
+        claim.retry_after_seconds,
+      );
+    }
+    if (claim.claim_status === "too_many_active") {
+      processingLeaseId = null;
+      return fail(
+        "Too many processing jobs are active. Please wait before retrying.",
+        429,
+        "rate_limited",
+        claim.retry_after_seconds,
+      );
+    }
+    if (claim.claim_status !== "claimed") {
+      processingLeaseId = null;
+      return fail(
+        "This document is not in a retryable processing state.",
         409,
         "conflict",
       );
     }
-
-    const { error: clearChunksError } = await supabase
-      .from("document_chunks")
-      .delete()
-      .eq("document_id", documentId);
-
-    if (clearChunksError) {
-      throw new Error(
-        `Could not clear previous document chunks: ${clearChunksError.message}`,
-      );
+    recoveredStaleLease = claim.recovered_stale_lease;
+    if (recoveredStaleLease) {
+      logOperational("warn", {
+        requestId,
+        functionName: "process-document",
+        operationType: "extraction",
+        stage: "process-document-stale-lease-recovered",
+        httpStatus: 200,
+        reasonCode: "stale_lease_recovered",
+        staleLeaseRecoveryCount: 1,
+      });
     }
 
     const { data: pdfFile, error: downloadError } = await supabase.storage
       .from("documents")
-      .download(document.storage_path);
+      .download(verifiedObject.path);
 
     if (downloadError || !pdfFile) {
       throw new Error(
@@ -316,12 +375,39 @@ Deno.serve(async (request) => {
     }
 
     const pdfBytes = new Uint8Array(await pdfFile.arrayBuffer());
+    const extractionStartedAt = Date.now();
     const pdf = await getDocumentProxy(pdfBytes);
+    if (pdf.numPages > MAX_PDF_PAGES) {
+      throw new HttpError(
+        422,
+        "PDF is too large for synchronous processing. Use a PDF with 500 pages or fewer.",
+        "resource_limit",
+      );
+    }
     const extracted = await extractText(pdf, { mergePages: false });
     const pages = Array.isArray(extracted.text)
       ? extracted.text
       : [extracted.text];
     const chunks = chunkExtractedPages(pages);
+    const extractedCharacterCount = pages.reduce(
+      (total, page) => total + page.length,
+      0,
+    );
+
+    if (extractedCharacterCount > MAX_EXTRACTED_CHARACTERS) {
+      throw new HttpError(
+        422,
+        "PDF is too large for synchronous processing. Reduce its searchable text and retry.",
+        "resource_limit",
+      );
+    }
+    if (chunks.length > MAX_DOCUMENT_CHUNKS) {
+      throw new HttpError(
+        422,
+        "PDF produces too many searchable sections for synchronous processing.",
+        "resource_limit",
+      );
+    }
 
     if (chunks.length === 0) {
       throw new Error(
@@ -335,57 +421,47 @@ Deno.serve(async (request) => {
       embedding_status: "pending",
     })));
 
-    for (
-      let offset = 0;
-      offset < chunksWithHashes.length;
-      offset += INSERT_BATCH_SIZE
-    ) {
-      const batch = chunksWithHashes.slice(offset, offset + INSERT_BATCH_SIZE)
-        .map((chunk) => ({
-          ...chunk,
-          document_id: documentId,
-        }));
-      const { error: insertError } = await supabase.from("document_chunks")
-        .insert(batch);
-
-      if (insertError) {
-        throw new Error(
-          `Could not save extracted text: ${insertError.message}`,
-        );
-      }
+    const { data: heartbeatAccepted, error: heartbeatError } = await supabase
+      .rpc("heartbeat_document_processing", {
+        target_document_id: documentId,
+        target_user_id: user.id,
+        target_lease_id: processingLeaseId,
+      });
+    if (heartbeatError || heartbeatAccepted !== true) {
+      throw new Error("The document processing lease expired.");
     }
 
-    const { data: readyDocument, error: readyStatusError } = await supabase
-      .from("documents")
-      .update({
-        processing_status: "ready",
-        processing_error: null,
-        page_count: extracted.totalPages,
-      })
-      .eq("id", documentId)
-      .eq("user_id", user.id)
-      .eq("processing_status", "processing")
-      .select("id")
-      .maybeSingle();
-
-    if (readyStatusError) {
-      throw new Error(
-        `The text was extracted, but the ready status could not be saved: ${readyStatusError.message}`,
-      );
+    const chunkInsertionStartedAt = Date.now();
+    const { data: savedChunkCount, error: completionError } = await supabase
+      .rpc("complete_document_extraction", {
+        target_document_id: documentId,
+        target_user_id: user.id,
+        target_lease_id: processingLeaseId,
+        extracted_page_count: extracted.totalPages,
+        extracted_character_count: extractedCharacterCount,
+        extracted_chunks: chunksWithHashes,
+      });
+    if (completionError || savedChunkCount !== chunks.length) {
+      throw new Error("The extracted text could not be saved atomically.");
     }
-
-    if (!readyDocument) {
-      throw new Error("The document changed or was deleted while processing.");
-    }
-
-    // Extraction readiness is independent from semantic-search readiness.
-    // Every embedding failure is contained so keyword Q&A remains available.
-    const embedding = await attemptDocumentEmbeddings(
-      supabase,
-      documentId,
-      documentTitle,
+    processingLeaseId = null;
+    logOperational("info", {
       requestId,
-    );
+      functionName: "process-document",
+      operationType: "extraction",
+      stage: "process-document-extraction-complete",
+      httpStatus: 200,
+      reasonCode: "none",
+      requestCount: 1,
+      successCount: 1,
+      chunkCount: chunks.length,
+      pageCount: extracted.totalPages,
+      extractedCharacterCount,
+      chunkInsertionDurationMs: Date.now() - chunkInsertionStartedAt,
+      documentReadyAt: new Date().toISOString(),
+      contextCharacterCount: extractedCharacterCount,
+      extractionDurationMs: Date.now() - extractionStartedAt,
+    });
 
     logOperational("info", {
       requestId,
@@ -400,34 +476,32 @@ Deno.serve(async (request) => {
       status: "ready",
       pageCount: extracted.totalPages,
       chunkCount: chunks.length,
-      embedding,
+      recoveredStaleLease,
+      embedding: pendingDocumentEmbeddingResult(chunks.length),
     });
   } catch (error) {
-    if (error instanceof HttpError) {
-      return fail(error.message, error.status, error.reasonCode);
-    }
-
     const errorMessage = getErrorMessage(error);
-    const safeErrorMessage =
-      errorMessage.startsWith("No searchable text was found")
-        ? errorMessage
-        : errorMessage === "The stored document is not a PDF."
-        ? errorMessage
-        : "PDF processing failed. Please retry or upload a different searchable PDF.";
+    const safeErrorMessage = error instanceof HttpError
+      ? error.message
+      : errorMessage.startsWith("No searchable text was found")
+      ? errorMessage
+      : errorMessage === "The stored document is not a PDF."
+      ? errorMessage
+      : "PDF processing failed. Please retry or upload a different searchable PDF.";
     const userInputFailure = safeErrorMessage.startsWith(
       "No searchable text was found",
     ) || safeErrorMessage === "The stored document is not a PDF.";
 
-    if (supabase && documentId && documentExists) {
-      const { error: failedStatusError } = await supabase
-        .from("documents")
-        .update({
-          processing_status: "failed",
-          processing_error: safeErrorMessage,
-          page_count: null,
-        })
-        .eq("id", documentId)
-        .eq("processing_status", "processing");
+    if (supabase && documentId && userId && processingLeaseId) {
+      const { error: failedStatusError } = await supabase.rpc(
+        "fail_document_processing",
+        {
+          target_document_id: documentId,
+          target_user_id: userId,
+          target_lease_id: processingLeaseId,
+          safe_failure_reason: safeErrorMessage,
+        },
+      );
 
       if (failedStatusError) {
         logOperational("error", {
@@ -442,8 +516,15 @@ Deno.serve(async (request) => {
 
     return fail(
       safeErrorMessage,
-      userInputFailure ? 422 : 500,
-      userInputFailure ? "invalid_request" : "internal_failure",
+      error instanceof HttpError ? error.status : userInputFailure ? 422 : 500,
+      error instanceof HttpError
+        ? error.reasonCode
+        : errorMessage === "The document processing lease expired."
+        ? "processing_timeout"
+        : errorMessage.startsWith("No searchable text was found")
+        ? "no_chunks_created"
+        : "extraction_failed",
+      error instanceof HttpError ? error.retryAfterSeconds : undefined,
     );
   }
 });

@@ -2,6 +2,7 @@ import { corsHeaders, jsonResponse } from "../_shared/cors.ts";
 import { HttpError, requireAuthenticatedUser } from "../_shared/auth.ts";
 import {
   extractSearchKeywords,
+  normalizeKeywordQuery,
   type PageChunk,
   PageReferenceError,
   parseRequestedPageNumbers,
@@ -38,6 +39,8 @@ import {
   buildPlainChunkContext,
   buildPlainSectionContext,
   citationsFromIds,
+  completeDocumentContextIsSafe,
+  resolveCitationSupport,
   selectAnswerSupportingCitationIds,
   type SourceCitation,
 } from "./document-sources.ts";
@@ -47,6 +50,7 @@ import {
   requestJsonResponse,
   type SafeReasonCode,
 } from "../_shared/request-context.ts";
+import { enforceRateLimit } from "../_shared/rate-limit.ts";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -57,7 +61,10 @@ const DEFAULT_RETRIEVED_CHUNKS = 6;
 const HYBRID_CANDIDATE_COUNT = 20;
 const MAX_CONTEXT_CHARACTERS = 24_000;
 const SUMMARY_BATCH_CHARACTERS = 18_000;
+const MAX_SYNCHRONOUS_SUMMARY_CHARACTERS = 250_000;
+const MAX_SYNCHRONOUS_SUMMARY_CHUNKS = 1_500;
 const CHUNK_PAGE_SIZE = 500;
+const FALLBACK_CHUNK_LIMIT = 200;
 const NOT_FOUND_ANSWER =
   "I could not find that information in the selected document.";
 const PAGE_NOT_FOUND_ANSWER =
@@ -93,29 +100,25 @@ function normalizeTopK(value: unknown): number {
 
 function limitChunksByContextSize(chunks: RetrievedChunk[]): RetrievedChunk[] {
   const boundedChunks: RetrievedChunk[] = [];
-  let usedCharacters = 0;
 
   for (const chunk of chunks) {
-    const separatorLength = boundedChunks.length > 0 ? "\n\n---\n\n".length : 0;
-    const metadataLength =
-      `[chunk_id=${chunk.id} page=${chunk.page_number}]\n`.length;
-    const remainingCharacters = MAX_CONTEXT_CHARACTERS -
-      usedCharacters -
-      separatorLength -
-      metadataLength;
-
-    if (remainingCharacters <= 0) break;
-
-    if (chunk.content.length <= remainingCharacters) {
+    if (
+      buildPlainChunkContext([...boundedChunks, chunk]).length <=
+        MAX_CONTEXT_CHARACTERS
+    ) {
       boundedChunks.push(chunk);
-      usedCharacters += separatorLength + metadataLength + chunk.content.length;
       continue;
     }
 
     if (boundedChunks.length === 0) {
+      const labelLength = buildPlainChunkContext([{ ...chunk, content: "" }])
+        .length;
       boundedChunks.push({
         ...chunk,
-        content: chunk.content.slice(0, remainingCharacters),
+        content: chunk.content.slice(
+          0,
+          Math.max(0, MAX_CONTEXT_CHARACTERS - labelLength),
+        ),
       });
     }
 
@@ -213,7 +216,7 @@ async function tryGenerateQueryEmbedding(
 async function runHybridRetrieval(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
   documentId: string,
-  question: string,
+  keywordQuery: string,
   queryEmbedding: QueryEmbedding,
   requestedPageNumbers: number[] | null,
   requestId: string,
@@ -222,7 +225,7 @@ async function runHybridRetrieval(
     target_document_id: documentId,
     query_embedding: queryEmbedding.vector,
     target_embedding_model: queryEmbedding.model,
-    keyword_query: question,
+    keyword_query: keywordQuery,
     requested_page_numbers: requestedPageNumbers,
     match_count: HYBRID_CANDIDATE_COUNT,
     semantic_weight: 1,
@@ -242,6 +245,47 @@ async function runHybridRetrieval(
   return (data ?? []) as HybridChunk[];
 }
 
+async function runKeywordRetrieval(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  documentId: string,
+  keywordQuery: string,
+): Promise<RetrievedChunk[]> {
+  if (!keywordQuery) return [];
+  const { data, error } = await supabase.rpc("search_document_chunks", {
+    target_document_id: documentId,
+    search_query: keywordQuery,
+    match_count: HYBRID_CANDIDATE_COUNT,
+  });
+  if (error) {
+    throw new Error("Could not search the extracted document text.");
+  }
+  return (data ?? []) as RetrievedChunk[];
+}
+
+async function loadFallbackDocumentChunks(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  documentId: string,
+): Promise<{ chunks: RetrievedChunk[]; completeAndContextSafe: boolean }> {
+  const { data, error } = await supabase
+    .from("document_chunks")
+    .select("id, content, page_number, chunk_index")
+    .eq("document_id", documentId)
+    .order("page_number", { ascending: true })
+    .order("chunk_index", { ascending: true })
+    .limit(FALLBACK_CHUNK_LIMIT + 1);
+  if (error) throw new Error("Could not load bounded fallback evidence.");
+  const chunks = (data ?? []) as RetrievedChunk[];
+  const completeAndContextSafe = completeDocumentContextIsSafe(
+    chunks,
+    FALLBACK_CHUNK_LIMIT,
+    MAX_CONTEXT_CHARACTERS,
+  );
+  return {
+    chunks: chunks.slice(0, FALLBACK_CHUNK_LIMIT),
+    completeAndContextSafe,
+  };
+}
+
 async function generatePlainAnswer(
   context: string,
   systemInstruction: string,
@@ -250,8 +294,10 @@ async function generatePlainAnswer(
   responseMode: ResponseMode,
   requestId: string,
 ): Promise<string> {
+  const providerStartedAt = Date.now();
+  let succeeded = false;
   try {
-    return await requestGeminiText({
+    const answer = await requestGeminiText({
       requestId,
       model: Deno.env.get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
       apiKey: requiredServerSecret("GEMINI_API_KEY"),
@@ -262,8 +308,22 @@ async function generatePlainAnswer(
       input,
       outputTokenBudget: maxOutputTokens,
     });
+    succeeded = true;
+    return answer;
   } catch (error) {
-    throwGeminiHttpError(error);
+    return throwGeminiHttpError(error);
+  } finally {
+    logOperational(succeeded ? "info" : "warn", {
+      requestId,
+      functionName: "chat-document",
+      operationType: "answer",
+      stage: "chat-document-answer-provider",
+      httpStatus: succeeded ? 200 : 0,
+      reasonCode: succeeded ? "none" : "provider_unavailable",
+      model: Deno.env.get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
+      contextCharacterCount: context.length,
+      providerDurationMs: Date.now() - providerStartedAt,
+    });
   }
 }
 
@@ -275,8 +335,10 @@ async function generateIntermediateSummary(
   responseMode: ResponseMode,
   requestId: string,
 ): Promise<string> {
+  const providerStartedAt = Date.now();
+  let succeeded = false;
   try {
-    return await requestGeminiText({
+    const answer = await requestGeminiText({
       requestId,
       model: Deno.env.get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
       apiKey: requiredServerSecret("GEMINI_API_KEY"),
@@ -287,8 +349,22 @@ async function generateIntermediateSummary(
       input,
       outputTokenBudget: maxOutputTokens,
     });
+    succeeded = true;
+    return answer;
   } catch (error) {
-    throwGeminiHttpError(error);
+    return throwGeminiHttpError(error);
+  } finally {
+    logOperational(succeeded ? "info" : "warn", {
+      requestId,
+      functionName: "chat-document",
+      operationType: "summary",
+      stage: "chat-document-summary-provider",
+      httpStatus: succeeded ? 200 : 0,
+      reasonCode: succeeded ? "none" : "provider_unavailable",
+      model: Deno.env.get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
+      contextCharacterCount: context.length,
+      providerDurationMs: Date.now() - providerStartedAt,
+    });
   }
 }
 
@@ -297,7 +373,7 @@ function throwGeminiHttpError(error: unknown): never {
 
   switch (error.code) {
     case "quota":
-      throw new HttpError(429, error.message, "provider_quota");
+      throw new HttpError(429, error.message, "provider_quota", 60);
     case "unavailable":
       throw new HttpError(503, error.message, "provider_unavailable");
     case "model_unavailable":
@@ -317,7 +393,7 @@ function throwGeminiHttpError(error: unknown): never {
       throw new HttpError(502, error.message, "provider_network_failure");
     case "invalid_request":
     case "provider_failure":
-      throw new HttpError(502, error.message, "provider_unavailable");
+      throw new HttpError(502, error.message, "provider_failed");
   }
 }
 
@@ -412,6 +488,20 @@ async function summarizeCompleteDocument(
 ): Promise<{ answer: string; chunks: RetrievedChunk[] }> {
   const chunks = await loadAllDocumentChunks(supabase, documentId);
   if (chunks.length === 0) return { answer: NOT_FOUND_ANSWER, chunks };
+  const totalCharacters = chunks.reduce(
+    (total, chunk) => total + chunk.content.length,
+    0,
+  );
+  if (
+    chunks.length > MAX_SYNCHRONOUS_SUMMARY_CHUNKS ||
+    totalCharacters > MAX_SYNCHRONOUS_SUMMARY_CHARACTERS
+  ) {
+    throw new HttpError(
+      422,
+      "This summary is too large to complete safely. Ask about a specific section instead.",
+      "resource_limit",
+    );
+  }
 
   const directContext = buildPlainChunkContext(chunks);
   const finalSystemInstruction = [
@@ -489,20 +579,30 @@ async function summarizeCompleteDocument(
 
 async function saveConversation(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
+  userId: string,
   documentId: string,
   question: string,
   answer: string,
   sources: SourceCitation[],
+  requestId: string,
 ) {
   const assistantContent = JSON.stringify({ answer, sources });
-  const { error } = await supabase.from("messages").insert([
-    { document_id: documentId, role: "user", content: question },
-    { document_id: documentId, role: "assistant", content: assistantContent },
-  ]);
+  const { error } = await supabase.rpc("persist_chat_message_pair", {
+    target_user_id: userId,
+    target_session_id: documentId,
+    target_document_id: documentId,
+    target_retrieval_mode: "single_document",
+    target_document_count: 1,
+    target_request_id: requestId,
+    user_content: question,
+    assistant_content: assistantContent,
+  });
 
   if (error) {
-    throw new Error(
-      `The answer was generated, but the chat history could not be saved: ${error.message}`,
+    throw new HttpError(
+      500,
+      "The answer was generated, but the chat history could not be saved.",
+      "message_persistence_failed",
     );
   }
 }
@@ -516,23 +616,35 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: "Only POST requests are supported." }, 405);
   }
 
-  const requestId = createRequestId();
+  const requestId = createRequestId(request.headers.get("x-request-id"));
   const startedAt = Date.now();
-  const respond = (body: Record<string, unknown>, status = 200) =>
-    requestJsonResponse(requestId, body, status);
+  const respond = (
+    body: Record<string, unknown>,
+    status = 200,
+    retryAfter?: number,
+  ) =>
+    requestJsonResponse(
+      requestId,
+      { ...body, ...(retryAfter ? { retryAfter } : {}) },
+      status,
+      retryAfter ? { "Retry-After": String(retryAfter) } : {},
+    );
   const fail = (
     message: string,
     status: number,
     reasonCode: SafeReasonCode,
+    retryAfter?: number,
   ) => {
     logOperational(status >= 500 ? "error" : "warn", {
       requestId,
       stage: "chat-document",
       httpStatus: status,
       reasonCode,
+      requestCount: 1,
+      failureCount: 1,
       durationMs: Date.now() - startedAt,
     });
-    return respond({ error: message }, status);
+    return respond({ error: message }, status, retryAfter);
   };
 
   try {
@@ -626,6 +738,8 @@ Deno.serve(async (request) => {
       );
     }
 
+    await enforceRateLimit(user.id, "chat", requestId);
+
     let requestedPageNumbers: number[];
 
     try {
@@ -641,6 +755,7 @@ Deno.serve(async (request) => {
     if (
       requestedPageNumbers.length === 0 && isCompleteDocumentIntent(question)
     ) {
+      await enforceRateLimit(user.id, "complete_summary", requestId);
       const summary = await summarizeCompleteDocument(
         supabase,
         documentId,
@@ -665,10 +780,12 @@ Deno.serve(async (request) => {
 
       await saveConversation(
         supabase,
+        user.id,
         documentId,
         question,
         answer,
         safeSources,
+        requestId,
       );
       return respond({
         answer,
@@ -677,7 +794,13 @@ Deno.serve(async (request) => {
       });
     }
 
+    const retrievalStartedAt = Date.now();
     let retrievedChunks: RetrievedChunk[];
+    const keywordQuery = normalizeKeywordQuery(question);
+    let keywordCandidateCount = 0;
+    let semanticCandidateCount = 0;
+    let hybridCandidateCount = 0;
+    let retrievalReasonCode: SafeReasonCode | "none" = "none";
 
     if (requestedPageNumbers.length > 0) {
       const { data: pageChunks, error: pageChunksError } = await supabase
@@ -704,10 +827,12 @@ Deno.serve(async (request) => {
       if (missingRequestedPage) {
         await saveConversation(
           supabase,
+          user.id,
           documentId,
           question,
           PAGE_NOT_FOUND_ANSWER,
           [],
+          requestId,
         );
         return respond({
           answer: PAGE_NOT_FOUND_ANSWER,
@@ -726,12 +851,13 @@ Deno.serve(async (request) => {
         question,
         HYBRID_CANDIDATE_COUNT,
       );
+      keywordCandidateCount = rankedPageChunks.length;
 
       const hybridPageChunks = queryEmbedding
         ? await runHybridRetrieval(
           supabase,
           documentId,
-          question,
+          keywordQuery,
           queryEmbedding,
           requestedPageNumbers,
           requestId,
@@ -739,6 +865,13 @@ Deno.serve(async (request) => {
         : null;
 
       if (hybridPageChunks && hybridPageChunks.length > 0) {
+        hybridCandidateCount = hybridPageChunks.length;
+        keywordCandidateCount = hybridPageChunks.filter((chunk) =>
+          chunk.keyword_score != null
+        ).length;
+        semanticCandidateCount = hybridPageChunks.filter((chunk) =>
+          chunk.semantic_score != null
+        ).length;
         retrievedChunks = selectDiversifiedChunks(hybridPageChunks, topK);
       } else {
         if (
@@ -747,10 +880,12 @@ Deno.serve(async (request) => {
         ) {
           await saveConversation(
             supabase,
+            user.id,
             documentId,
             question,
             PAGE_TOPIC_NOT_FOUND_ANSWER,
             [],
+            requestId,
           );
           return respond({
             answer: PAGE_TOPIC_NOT_FOUND_ANSWER,
@@ -772,39 +907,56 @@ Deno.serve(async (request) => {
         question,
         requestId,
       );
+      if (!queryEmbedding) {
+        retrievalReasonCode = "semantic_unavailable_keyword_active";
+      }
       const hybridChunks = queryEmbedding
         ? await runHybridRetrieval(
           supabase,
           documentId,
-          question,
+          keywordQuery,
           queryEmbedding,
           null,
           requestId,
         )
         : null;
 
-      if (hybridChunks !== null) {
+      if (hybridChunks && hybridChunks.length > 0) {
+        hybridCandidateCount = hybridChunks.length;
+        keywordCandidateCount = hybridChunks.filter((chunk) =>
+          chunk.keyword_score != null
+        ).length;
+        semanticCandidateCount = hybridChunks.filter((chunk) =>
+          chunk.semantic_score != null
+        ).length;
         retrievedChunks = selectDiversifiedChunks(hybridChunks, topK);
       } else {
-        const { data: chunks, error: searchError } = await supabase.rpc(
-          "search_document_chunks",
-          {
-            target_document_id: documentId,
-            search_query: question,
-            match_count: HYBRID_CANDIDATE_COUNT,
-          },
+        const keywordChunks = await runKeywordRetrieval(
+          supabase,
+          documentId,
+          keywordQuery,
         );
-
-        if (searchError) {
-          throw new Error(
-            `Could not search the extracted document text: ${searchError.message}`,
+        keywordCandidateCount = keywordChunks.length;
+        if (keywordChunks.length > 0) {
+          retrievedChunks = selectDiversifiedChunks(keywordChunks, topK);
+        } else {
+          retrievalReasonCode = "keyword_no_match";
+          const fallback = await loadFallbackDocumentChunks(
+            supabase,
+            documentId,
           );
+          const lexicalChunks = rankChunksWithinPages(
+            fallback.chunks,
+            question,
+            HYBRID_CANDIDATE_COUNT,
+          );
+          keywordCandidateCount = lexicalChunks.length;
+          retrievedChunks = lexicalChunks.length > 0
+            ? selectDiversifiedChunks(lexicalChunks, topK)
+            : fallback.completeAndContextSafe
+            ? fallback.chunks
+            : [];
         }
-
-        retrievedChunks = selectDiversifiedChunks(
-          (chunks ?? []) as RetrievedChunk[],
-          topK,
-        );
       }
     }
 
@@ -814,8 +966,15 @@ Deno.serve(async (request) => {
       requestId,
       stage: "chat-document-retrieval",
       httpStatus: 200,
-      reasonCode: "none",
+      reasonCode: retrievedChunks.length > 0
+        ? retrievalReasonCode
+        : "retrieval_no_evidence",
       chunkCount: retrievedChunks.length,
+      keywordCandidateCount,
+      semanticCandidateCount,
+      hybridCandidateCount,
+      selectedChunkCount: retrievedChunks.length,
+      retrievalDurationMs: Date.now() - retrievalStartedAt,
       durationMs: Date.now() - startedAt,
     });
 
@@ -823,8 +982,21 @@ Deno.serve(async (request) => {
       const answer = requestedPageNumbers.length > 0
         ? PAGE_TOPIC_NOT_FOUND_ANSWER
         : NOT_FOUND_ANSWER;
-      await saveConversation(supabase, documentId, question, answer, []);
-      return respond({ answer, sources: [], notFound: true });
+      await saveConversation(
+        supabase,
+        user.id,
+        documentId,
+        question,
+        answer,
+        [],
+        requestId,
+      );
+      return respond({
+        answer,
+        sources: [],
+        notFound: true,
+        reasonCode: "retrieval_no_evidence",
+      });
     }
 
     const unsupportedAnswer = requestedPageNumbers.length > 0
@@ -846,39 +1018,99 @@ Deno.serve(async (request) => {
       requestId,
     );
 
+    const citationResolution = await resolveCitationSupport(
+      generatedAnswer,
+      retrievedChunks,
+      question,
+      responseMode,
+      unsupportedAnswer,
+      () =>
+        generatePlainAnswer(
+          buildPlainChunkContext(retrievedChunks),
+          [
+            "Answer only from the supplied document context.",
+            "Use concise wording close to the supporting evidence.",
+            "Include no claim that is not directly supported.",
+            `If the context is insufficient, answer exactly "${unsupportedAnswer}".`,
+            "Return plain answer text only.",
+          ].join(" "),
+          `Answer the same question using wording close to the evidence: ${question}`,
+          RESPONSE_MODES[responseMode].maxOutputTokens,
+          responseMode,
+          requestId,
+        ),
+    );
+    const answerText = citationResolution.answer;
+    const citationIds = citationResolution.citationIds;
+    if (
+      citationResolution.regenerated ||
+      citationResolution.usedExtractiveFallback
+    ) {
+      logOperational("warn", {
+        requestId,
+        stage: "chat-document-citation-fallback",
+        httpStatus: 200,
+        reasonCode: citationResolution.initialStatus === "uncertain"
+          ? "citation_validation_uncertain"
+          : "citation_validation_failed",
+        citationValidationResult: citationResolution.initialStatus,
+      });
+    }
     const sources = citationsFromIds(
-      selectAnswerSupportingCitationIds(
-        generatedAnswer,
-        retrievedChunks,
-        responseMode,
-      ),
+      citationIds,
       retrievedChunks,
       question,
       RESPONSE_MODES[responseMode].maxSources,
     );
-    logOperational("info", {
+    logOperational(citationIds.length > 0 ? "info" : "warn", {
       requestId,
       stage: "chat-document-citations",
       httpStatus: 200,
-      reasonCode: "none",
+      reasonCode: citationIds.length > 0
+        ? "none"
+        : citationResolution.status === "uncertain"
+        ? "citation_validation_uncertain"
+        : "citation_validation_failed",
       chunkCount: sources.length,
+      citationValidationResult: citationIds.length > 0
+        ? "supported"
+        : citationResolution.status,
       durationMs: Date.now() - startedAt,
     });
-    const answerText = generatedAnswer.trim();
     const answerFound = answerText !== unsupportedAnswer && sources.length > 0;
     const answer = answerFound ? answerText : unsupportedAnswer;
     const safeSources = answerFound ? sources : [];
 
-    await saveConversation(supabase, documentId, question, answer, safeSources);
+    await saveConversation(
+      supabase,
+      user.id,
+      documentId,
+      question,
+      answer,
+      safeSources,
+      requestId,
+    );
 
     return respond({
       answer,
       sources: safeSources,
       notFound: !answerFound,
+      reasonCode: answerFound
+        ? "none"
+        : citationResolution.status === "uncertain"
+        ? "citation_validation_uncertain"
+        : citationResolution.status === "failed"
+        ? "citation_validation_failed"
+        : "retrieval_no_evidence",
     });
   } catch (error) {
     if (error instanceof HttpError) {
-      return fail(error.message, error.status, error.reasonCode);
+      return fail(
+        error.message,
+        error.status,
+        error.reasonCode,
+        error.retryAfterSeconds,
+      );
     }
 
     return fail(

@@ -5,6 +5,7 @@ import {
 } from "../_shared/gemini-embeddings.ts";
 import {
   embedDocumentChunks,
+  pendingDocumentEmbeddingResult,
   type StoredEmbeddingChunk,
 } from "./document-embeddings.ts";
 
@@ -178,6 +179,49 @@ function vectorResponse(): Response {
 }
 
 const NO_DELAY = () => Promise.resolve();
+
+Deno.test("extraction completion reports pending semantic indexing", () => {
+  assertEquals(pendingDocumentEmbeddingResult(17), {
+    status: "pending",
+    totalChunks: 17,
+    embeddedChunks: 0,
+    skippedChunks: 0,
+    failedChunks: 0,
+    error: null,
+  });
+});
+
+Deno.test("successful embedding batches never incur a fixed delay", async () => {
+  const database = new TestDatabase(
+    Array.from(
+      { length: 11 },
+      (_, index) =>
+        testChunk(`chunk-${index + 1}`, `Searchable chunk ${index + 1}.`),
+    ),
+  );
+  let requestCount = 0;
+  let delayCount = 0;
+
+  const result = await embedDocumentChunks(
+    database as never,
+    "document-1",
+    "test-key",
+    "No Fixed Delay.pdf",
+    async () => {
+      requestCount += 1;
+      return vectorResponse();
+    },
+    () => {
+      delayCount += 1;
+      return Promise.resolve();
+    },
+  );
+
+  assertEquals(result.status, "ready");
+  assertEquals(result.embeddedChunks, 11);
+  assertEquals(requestCount, 11);
+  assertEquals(delayCount, 0);
+});
 
 Deno.test("backfill retries failed chunks and remains idempotent", async () => {
   const chunk = testChunk("chunk-1", "Backfill this existing document chunk.");

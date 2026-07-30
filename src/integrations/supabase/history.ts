@@ -25,7 +25,7 @@ export async function loadAllHistoryMessages(documentIds: string[]): Promise<Per
     .order("id", { ascending: true });
 
   if (error) {
-    throw new Error(`Could not load Q&A history: ${error.message}`);
+    throw new Error("Could not load Q&A history. Please retry.");
   }
 
   return (data ?? []) as PersistedMessage[];
@@ -38,7 +38,7 @@ export async function clearDocumentHistory(documentId: string): Promise<void> {
   });
 
   if (error) {
-    throw new Error(`Could not clear this document's history: ${error.message}`);
+    throw new Error("Could not clear this document's history. Please retry.");
   }
 }
 
@@ -49,6 +49,6 @@ export async function clearAllHistory(): Promise<void> {
   });
 
   if (error) {
-    throw new Error(`Could not clear Q&A history: ${error.message}`);
+    throw new Error("Could not clear Q&A history. Please retry.");
   }
 }

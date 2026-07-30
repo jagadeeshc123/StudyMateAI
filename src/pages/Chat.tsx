@@ -39,6 +39,7 @@ import {
   createChatSession,
   loadSessionHistory,
 } from "@/integrations/supabase/sessions";
+import { EdgeFunctionError } from "@/integrations/supabase/edge-functions";
 
 interface Message {
   id: string;
@@ -89,6 +90,7 @@ const Chat = () => {
   const [documentsLoading, setDocumentsLoading] = useState(true);
   const [documentsError, setDocumentsError] = useState<string | null>(null);
   const [responseMode, setResponseMode] = useState<ResponseMode>("balanced");
+  const [retryRequest, setRetryRequest] = useState<{ id: string; question: string } | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const { user } = useAuth();
@@ -249,7 +251,9 @@ const Chat = () => {
   const handleSend = async () => {
     const question = input.trim();
     if (!question || selectedDocumentIds.length === 0 || isLoading) return;
-    const optimisticId = crypto.randomUUID();
+    const optimisticId = retryRequest?.question === question
+      ? retryRequest.id
+      : crypto.randomUUID();
     setMessages((current) => [...current, { id: optimisticId, role: "user", content: question, sources: [] }]);
     setInput("");
     setChatError(null);
@@ -257,7 +261,12 @@ const Chat = () => {
     try {
       let answer;
       if (mode === "single_document" && !sessionId) {
-        answer = await askDocument(selectedDocumentIds[0], question, responseMode);
+        answer = await askDocument(
+          selectedDocumentIds[0],
+          question,
+          responseMode,
+          optimisticId,
+        );
       } else {
         let trustedSessionId = sessionId;
         if (!trustedSessionId) {
@@ -278,6 +287,7 @@ const Chat = () => {
           selectedDocumentIds,
           question,
           responseMode,
+          optimisticId,
         );
       }
       setMessages((current) => [...current, {
@@ -286,10 +296,17 @@ const Chat = () => {
         content: answer.answer,
         sources: answer.sources,
       }]);
+      setRetryRequest(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : "The question could not be answered.";
+      if (error instanceof EdgeFunctionError && error.status === 404) {
+        if (user) clearActiveSession(user.id);
+        setSessionId(null);
+        setSearchParams({}, { replace: true });
+      }
       setMessages((current) => current.filter((item) => item.id !== optimisticId));
       setInput(question);
+      setRetryRequest({ id: optimisticId, question });
       setChatError(message);
       toast.error(message);
     } finally {
@@ -450,7 +467,12 @@ const Chat = () => {
               <form onSubmit={(event) => { event.preventDefault(); void handleSend(); }} className="flex gap-2">
                 <Input
                   value={input}
-                  onChange={(event) => setInput(event.target.value)}
+                  onChange={(event) => {
+                    setInput(event.target.value);
+                    if (retryRequest && event.target.value.trim() !== retryRequest.question) {
+                      setRetryRequest(null);
+                    }
+                  }}
                   placeholder={selectedDocumentIds.length > 0 ? "Ask about or compare the selected documents..." : "Select a ready document first..."}
                   maxLength={1_000}
                   disabled={inputDisabled}

@@ -16,7 +16,6 @@ import {
 } from "../_shared/request-context.ts";
 
 const CHUNK_LOAD_PAGE_SIZE = 500;
-const FREE_TIER_BATCH_PAUSE_MS = 6_000;
 const PROCESSING_LEASE_MINUTES = 10;
 
 export interface StoredEmbeddingChunk {
@@ -35,12 +34,25 @@ export interface PlannedEmbeddingChunk {
 }
 
 export interface DocumentEmbeddingResult {
-  status: "ready" | "failed" | "skipped";
+  status: "pending" | "ready" | "failed" | "skipped";
   totalChunks: number;
   embeddedChunks: number;
   skippedChunks: number;
   failedChunks: number;
   error: string | null;
+}
+
+export function pendingDocumentEmbeddingResult(
+  totalChunks: number,
+): DocumentEmbeddingResult {
+  return {
+    status: "pending",
+    totalChunks,
+    embeddedChunks: 0,
+    skippedChunks: 0,
+    failedChunks: 0,
+    error: null,
+  };
 }
 
 export async function planDocumentEmbeddings(
@@ -167,6 +179,8 @@ export async function embedDocumentChunks(
   delay: (milliseconds: number) => Promise<void> = defaultDelay,
   requestId: string = crypto.randomUUID(),
 ): Promise<DocumentEmbeddingResult> {
+  const embeddingStartedAt = Date.now();
+  let embeddingRequestCount = 0;
   const configuration = embeddingConfigurationFromEnvironment();
   const staleBefore = new Date(
     Date.now() - PROCESSING_LEASE_MINUTES * 60_000,
@@ -252,7 +266,8 @@ export async function embedDocumentChunks(
           dimensions: configuration.dimensions,
         },
         fetchEmbedding,
-        (level, diagnostic) =>
+        (level, diagnostic) => {
+          embeddingRequestCount += 1;
           logOperational(level, {
             requestId,
             stage: "process-document-embedding-provider",
@@ -262,7 +277,8 @@ export async function embedDocumentChunks(
               : embeddingReasonCode(diagnostic.errorCode),
             model: diagnostic.model,
             chunkCount: diagnostic.inputCount,
-          }),
+          });
+        },
         delay,
       );
 
@@ -302,10 +318,6 @@ export async function embedDocumentChunks(
       );
       break;
     }
-
-    if (offset + GEMINI_EMBEDDING_BATCH_SIZE < planned.length) {
-      await delay(FREE_TIER_BATCH_PAUSE_MS);
-    }
   }
 
   logOperational(failedChunks > 0 ? "warn" : "info", {
@@ -315,6 +327,8 @@ export async function embedDocumentChunks(
     reasonCode: failedChunks > 0 ? "provider_unavailable" : "none",
     model: configuration.model,
     chunkCount: chunks.length,
+    embeddingRequestCount,
+    embeddingDurationMs: Date.now() - embeddingStartedAt,
   });
 
   return {

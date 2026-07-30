@@ -36,6 +36,7 @@ export async function askDocument(
   documentId: string,
   question: string,
   responseMode: ResponseMode = "balanced",
+  requestId?: string,
 ): Promise<ChatAnswer> {
   const topK = responseMode === "concise" ? 3 : responseMode === "detailed" ? 8 : 6;
   return invokeEdgeFunction<ChatAnswer>("chat-document", {
@@ -43,7 +44,7 @@ export async function askDocument(
     question,
     top_k: topK,
     response_mode: responseMode,
-  });
+  }, requestId);
 }
 
 export async function loadChatHistory(documentId: string): Promise<PersistedMessage[]> {

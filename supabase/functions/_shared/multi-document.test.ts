@@ -180,3 +180,62 @@ Deno.test("multi-document citations require collective claim support", () => {
     [],
   );
 });
+
+Deno.test("collective support rejects negation and numerical mismatches", () => {
+  const chunks: MultiDocumentChunk[] = [{
+    id: "survey",
+    documentId: "a",
+    documentPosition: 1,
+    documentName: "Survey",
+    pageNumber: 3,
+    chunkIndex: 0,
+    content: "The survey included 120 students and reported improved recall.",
+  }];
+  assertEquals(
+    selectCollectivelySupportingCitationIds(
+      "The survey did not report improved recall.",
+      chunks,
+      "balanced",
+    ),
+    [],
+  );
+  assertEquals(
+    selectCollectivelySupportingCitationIds(
+      "The survey included 200 students.",
+      chunks,
+      "balanced",
+    ),
+    [],
+  );
+});
+
+Deno.test("conflicting document clauses can be supported independently", () => {
+  const chunks: MultiDocumentChunk[] = [
+    {
+      id: "supports",
+      documentId: "a",
+      documentPosition: 1,
+      documentName: "Study A",
+      pageNumber: 1,
+      chunkIndex: 0,
+      content: "Study A reports that caffeine improves recall.",
+    },
+    {
+      id: "negates",
+      documentId: "b",
+      documentPosition: 2,
+      documentName: "Study B",
+      pageNumber: 2,
+      chunkIndex: 0,
+      content: "Study B reports that caffeine does not improve recall.",
+    },
+  ];
+  assertEquals(
+    selectCollectivelySupportingCitationIds(
+      "Study A reports caffeine improves recall, whereas Study B reports caffeine does not improve recall.",
+      chunks,
+      "balanced",
+    ),
+    ["supports", "negates"],
+  );
+});

@@ -73,7 +73,9 @@ export function chunkExtractedPages(pages: string[]): DocumentChunk[] {
 
       const nextStart = Math.max(end - CHUNK_OVERLAP, start + 1);
       const nextWhitespace = pageText.indexOf(" ", nextStart);
-      start = nextWhitespace >= 0 && nextWhitespace < end ? nextWhitespace + 1 : nextStart;
+      start = nextWhitespace >= 0 && nextWhitespace < end
+        ? nextWhitespace + 1
+        : nextStart;
     }
   });
 

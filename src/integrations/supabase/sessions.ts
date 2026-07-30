@@ -63,6 +63,7 @@ export async function askSession(
   documentIds: string[],
   question: string,
   responseMode: ResponseMode,
+  requestId?: string,
 ): Promise<ChatAnswer> {
   return invokeEdgeFunction<ChatAnswer>("chat-session", {
     action: "ask",
@@ -70,7 +71,7 @@ export async function askSession(
     documentIds,
     question,
     response_mode: responseMode,
-  });
+  }, requestId);
 }
 
 export async function listChatSessions(): Promise<ChatSessionSummary[]> {

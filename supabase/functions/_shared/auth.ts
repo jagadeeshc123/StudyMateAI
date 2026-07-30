@@ -10,6 +10,7 @@ export class HttpError extends Error {
     public readonly status: number,
     message: string,
     public readonly reasonCode: SafeReasonCode = "invalid_request",
+    public readonly retryAfterSeconds?: number,
   ) {
     super(message);
     this.name = "HttpError";

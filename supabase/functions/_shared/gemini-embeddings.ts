@@ -1,12 +1,13 @@
 export const DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-2";
 export const DEFAULT_GEMINI_EMBEDDING_DIMENSIONS = 768;
 export const GEMINI_EMBEDDING_BATCH_SIZE = 10;
-export const GEMINI_EMBEDDING_CONCURRENCY = 3;
+export const GEMINI_EMBEDDING_CONCURRENCY = 2;
 
 const GEMINI_MODELS_ROOT =
   "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_TRANSIENT_RETRIES = 2;
 const INITIAL_RETRY_DELAY_MS = 500;
+const MAX_RETRY_JITTER_MS = 250;
 export const GEMINI_EMBEDDING_TIMEOUT_MS = 30_000;
 
 export type GeminiEmbeddingErrorCode =
@@ -162,6 +163,7 @@ function providerError(status: number): GeminiEmbeddingError {
     return new GeminiEmbeddingError(
       "quota",
       "The free Gemini embedding quota has been exhausted. Keyword search remains available.",
+      true,
     );
   }
   if (status >= 500 && status <= 599) {
@@ -208,11 +210,17 @@ function validatedVector(payload: unknown, dimensions: number): number[] {
 }
 
 const defaultLogger: GeminiEmbeddingLogger = (level, diagnostics) => {
+  if (Deno.env.get("OBSERVABILITY_ENABLED")?.toLowerCase() !== "true") return;
   console[level]("Gemini embeddings", diagnostics);
 };
 
 const defaultDelay: EmbeddingDelay = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function retryDelayMilliseconds(attempt: number): number {
+  const exponentialDelay = INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1);
+  return exponentialDelay + Math.floor(Math.random() * MAX_RETRY_JITTER_MS);
+}
 
 async function requestEmbedding(
   text: string,
@@ -261,7 +269,7 @@ async function requestEmbedding(
       });
 
       if (attempt <= MAX_TRANSIENT_RETRIES) {
-        await delay(INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1));
+        await delay(retryDelayMilliseconds(attempt));
         continue;
       }
       throw error;
@@ -282,7 +290,7 @@ async function requestEmbedding(
       });
 
       if (error.transient && attempt <= MAX_TRANSIENT_RETRIES) {
-        await delay(INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1));
+        await delay(retryDelayMilliseconds(attempt));
         continue;
       }
       throw error;

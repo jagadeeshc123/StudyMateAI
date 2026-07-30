@@ -39,6 +39,7 @@ const STATUS_LABELS: Record<FileStatus, string> = {
   ready: "Ready",
   failed: "Failed",
 };
+const MAX_UPLOAD_BATCH_SIZE = 5;
 
 const Upload = () => {
   const [files, setFiles] = useState<BatchFile[]>([]);
@@ -54,6 +55,17 @@ const Upload = () => {
 
   const addFiles = async (candidateFiles: File[]) => {
     if (candidateFiles.length === 0) return;
+    const availableSlots = Math.max(MAX_UPLOAD_BATCH_SIZE - files.length, 0);
+    if (availableSlots === 0) {
+      toast.error(`Upload no more than ${MAX_UPLOAD_BATCH_SIZE} PDFs at a time.`);
+      return;
+    }
+    if (candidateFiles.length > availableSlots) {
+      toast.error(
+        `Only the first ${availableSlots} file(s) were added. Upload no more than ${MAX_UPLOAD_BATCH_SIZE} PDFs at a time.`,
+      );
+    }
+    candidateFiles = candidateFiles.slice(0, availableSlots);
 
     setBatchSummary(null);
     const candidates: BatchFile[] = candidateFiles.map((file) => ({
@@ -164,7 +176,7 @@ const Upload = () => {
           <Card className="border-2">
             <CardHeader>
               <CardTitle>PDF Documents</CardTitle>
-              <CardDescription>Up to 20 MB each. Invalid files do not block valid files.</CardDescription>
+              <CardDescription>Up to five searchable PDFs per batch and 20 MB each. Invalid files do not block valid files.</CardDescription>
             </CardHeader>
             <CardContent>
               <div

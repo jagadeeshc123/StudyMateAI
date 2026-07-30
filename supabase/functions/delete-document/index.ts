@@ -7,6 +7,7 @@ import {
   requestJsonResponse,
   type SafeReasonCode,
 } from "../_shared/request-context.ts";
+import { enforceRateLimit } from "../_shared/rate-limit.ts";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -24,29 +25,42 @@ Deno.serve(async (request) => {
     return jsonResponse({ error: "Only POST requests are supported." }, 405);
   }
 
-  const requestId = createRequestId();
+  const requestId = createRequestId(request.headers.get("x-request-id"));
   const startedAt = Date.now();
-  const respond = (body: Record<string, unknown>, status = 200) =>
-    requestJsonResponse(requestId, body, status);
+  const respond = (
+    body: Record<string, unknown>,
+    status = 200,
+    retryAfter?: number,
+  ) =>
+    requestJsonResponse(
+      requestId,
+      { ...body, ...(retryAfter ? { retryAfter } : {}) },
+      status,
+      retryAfter ? { "Retry-After": String(retryAfter) } : {},
+    );
   const fail = (
     message: string,
     status: number,
     reasonCode: SafeReasonCode,
+    retryAfter?: number,
   ) => {
     logOperational(status >= 500 ? "error" : "warn", {
       requestId,
       stage: "delete-document",
       httpStatus: status,
       reasonCode,
+      requestCount: 1,
+      failureCount: 1,
       durationMs: Date.now() - startedAt,
     });
-    return respond({ error: message }, status);
+    return respond({ error: message }, status, retryAfter);
   };
 
   try {
     const { user, supabase: callerSupabase } = await requireAuthenticatedUser(
       request,
     );
+    await enforceRateLimit(user.id, "delete_document", requestId);
     const body = (await request.json()) as DeleteDocumentBody;
     const documentId = typeof body.documentId === "string"
       ? body.documentId
@@ -82,7 +96,11 @@ Deno.serve(async (request) => {
     if (previousStatus) {
       const { data: claimedDocument, error: claimError } = await supabase
         .from("documents")
-        .update({ processing_status: "deleting" })
+        .update({
+          processing_status: "deleting",
+          processing_lease_id: null,
+          processing_heartbeat_at: null,
+        })
         .eq("id", documentId)
         .eq("user_id", user.id)
         .eq("processing_status", previousStatus)
@@ -114,7 +132,14 @@ Deno.serve(async (request) => {
       if (previousStatus) {
         const { error: restoreError } = await supabase
           .from("documents")
-          .update({ processing_status: previousStatus })
+          .update({
+            processing_status: previousStatus === "processing"
+              ? "failed"
+              : previousStatus,
+            processing_error: previousStatus === "processing"
+              ? "Processing was interrupted while deletion was attempted. Retry processing when ready."
+              : undefined,
+          })
           .eq("id", documentId)
           .eq("user_id", user.id)
           .eq("processing_status", "deleting");
@@ -147,6 +172,16 @@ Deno.serve(async (request) => {
       .maybeSingle();
 
     if (deleteError) {
+      logOperational("error", {
+        requestId,
+        functionName: "delete-document",
+        operationType: "delete_document",
+        stage: "delete-document-partial-failure",
+        httpStatus: 500,
+        reasonCode: "database_failure",
+        deletionPartialFailureCount: 1,
+        durationMs: Date.now() - startedAt,
+      });
       return fail(
         "The private file was deleted, but its document record could not be removed. Please retry deletion.",
         500,
@@ -171,12 +206,19 @@ Deno.serve(async (request) => {
       stage: "delete-document-complete",
       httpStatus: 200,
       reasonCode: "none",
+      requestCount: 1,
+      successCount: 1,
       durationMs: Date.now() - startedAt,
     });
     return respond({ documentId, deleted: true });
   } catch (error) {
     if (error instanceof HttpError) {
-      return fail(error.message, error.status, error.reasonCode);
+      return fail(
+        error.message,
+        error.status,
+        error.reasonCode,
+        error.retryAfterSeconds,
+      );
     }
 
     return fail(

@@ -11,3 +11,9 @@ verify_jwt = true
 
 [functions.chat-session]
 verify_jwt = true
+
+[functions.register-document]
+verify_jwt = true
+
+[functions.health-check]
+verify_jwt = false

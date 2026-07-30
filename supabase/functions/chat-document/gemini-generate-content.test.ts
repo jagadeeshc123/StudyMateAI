@@ -93,8 +93,9 @@ async function assertProviderError(
   try {
     await requestGeminiText(
       requestOptions(),
-      async () => response,
+      async () => response.clone(),
       NO_DIAGNOSTIC_LOG,
+      async () => undefined,
     );
   } catch (error) {
     if (
@@ -227,6 +228,7 @@ Deno.test("provider timeouts are distinct from network failures", async () => {
           );
         }),
       NO_DIAGNOSTIC_LOG,
+      async () => undefined,
     );
   } catch (error) {
     if (error instanceof GeminiProviderError && error.code === "timeout") {
@@ -257,6 +259,23 @@ Deno.test("MAX_TOKENS retries once with a doubled budget", async () => {
 
   assertEquals(answer, "The retry completed successfully.");
   assertEquals(budgets, [2_048, 4_096]);
+});
+
+Deno.test("a transient 503 recovers with one bounded retry", async () => {
+  let calls = 0;
+  const answer = await requestGeminiText(
+    requestOptions(),
+    async () => {
+      calls += 1;
+      return calls === 1
+        ? googleErrorResponse(503, "UNAVAILABLE", "temporary")
+        : completedResponse("Recovered answer.");
+    },
+    NO_DIAGNOSTIC_LOG,
+    async () => undefined,
+  );
+  assertEquals(answer, "Recovered answer.");
+  assertEquals(calls, 2);
 });
 
 Deno.test("a second MAX_TOKENS response is not retried again", async () => {

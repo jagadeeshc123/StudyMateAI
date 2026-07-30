@@ -168,8 +168,9 @@ Deno.test("model changes force backfill while matching ready embeddings skip", a
   );
 });
 
-Deno.test("free quota exhaustion is not retried and remains fallback-safe", async () => {
+Deno.test("free quota exhaustion uses bounded exponential backoff", async () => {
   let requestCount = 0;
+  const delays: number[] = [];
 
   try {
     await generateGeminiEmbeddings(
@@ -180,11 +181,21 @@ Deno.test("free quota exhaustion is not retried and remains fallback-safe", asyn
         return new Response("quota", { status: 429 });
       },
       NO_LOG,
-      NO_DELAY,
+      (milliseconds) => {
+        delays.push(milliseconds);
+        return Promise.resolve();
+      },
     );
   } catch (error) {
     if (error instanceof GeminiEmbeddingError && error.code === "quota") {
-      assertEquals(requestCount, 1);
+      assertEquals(requestCount, 3);
+      assertEquals(delays.length, 2);
+      if (delays[0] < 500 || delays[0] >= 750) {
+        throw new Error(`Unexpected first retry delay: ${delays[0]}`);
+      }
+      if (delays[1] < 1_000 || delays[1] >= 1_250) {
+        throw new Error(`Unexpected second retry delay: ${delays[1]}`);
+      }
       return;
     }
     throw error;

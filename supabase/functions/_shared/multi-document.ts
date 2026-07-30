@@ -298,19 +298,36 @@ function claimTokens(value: string): Set<string> {
   );
 }
 
+interface ClaimTerms {
+  tokens: Set<string>;
+  numbers: Set<string>;
+  negated: boolean;
+}
+
+function claimTerms(value: string): ClaimTerms {
+  const tokens = claimTokens(value);
+  return {
+    tokens,
+    numbers: new Set([...tokens].filter((token) => /^\d+$/.test(token))),
+    negated:
+      /\b(?:no|not|never|without|cannot|can't|doesn't|isn't|aren't|didn't)\b/i
+        .test(value),
+  };
+}
+
 export function selectCollectivelySupportingCitationIds(
   answer: string,
   chunks: MultiDocumentChunk[],
   mode: ResponseMode,
 ): string[] {
   const claims = answer
-    .split(/(?<=[.!?])\s+|\n+/u)
-    .map(claimTokens)
-    .filter((tokens) => tokens.size >= 2);
+    .split(/(?<=[.!?])\s+|\n+|\b(?:while|whereas|but)\b/iu)
+    .map(claimTerms)
+    .filter((terms) => terms.tokens.size >= 2);
   if (claims.length === 0 || chunks.length === 0) return [];
 
-  const evidenceTokens = chunks.map((chunk) =>
-    claimTokens(`${chunk.documentName} ${chunk.content}`)
+  const evidenceTerms = chunks.map((chunk) =>
+    claimTerms(`${chunk.documentName} ${chunk.content}`)
   );
   const selectedIds: string[] = [];
 
@@ -318,10 +335,14 @@ export function selectCollectivelySupportingCitationIds(
     const collective = new Set<string>();
     const scored: Array<{ id: string; shared: number }> = [];
 
-    evidenceTokens.forEach((tokens, index) => {
+    evidenceTerms.forEach((terms, index) => {
+      if (terms.negated !== claim.negated) return;
+      for (const number of claim.numbers) {
+        if (!terms.numbers.has(number)) return;
+      }
       let shared = 0;
-      for (const token of claim) {
-        if (tokens.has(token)) {
+      for (const token of claim.tokens) {
+        if (terms.tokens.has(token)) {
           shared += 1;
           collective.add(token);
         }
@@ -329,7 +350,9 @@ export function selectCollectivelySupportingCitationIds(
       if (shared >= 2) scored.push({ id: chunks[index].id, shared });
     });
 
-    if (collective.size / claim.size < 0.5 || scored.length === 0) return [];
+    if (collective.size / claim.tokens.size < 0.5 || scored.length === 0) {
+      return [];
+    }
     scored.sort((left, right) => right.shared - left.shared);
     selectedIds.push(...scored.slice(0, 2).map((candidate) => candidate.id));
   }

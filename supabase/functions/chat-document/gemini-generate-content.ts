@@ -71,6 +71,8 @@ export type GeminiDiagnosticLogger = (
   diagnostics: GeminiSafeDiagnostics,
 ) => void;
 
+export type GeminiRetryDelay = (milliseconds: number) => Promise<void>;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
@@ -278,13 +280,24 @@ function httpError(
 }
 
 const defaultLogger: GeminiDiagnosticLogger = (level, diagnostics) => {
+  if (Deno.env.get("OBSERVABILITY_ENABLED")?.toLowerCase() !== "true") return;
   console[level]("Gemini generateContent", diagnostics);
 };
+
+const defaultRetryDelay: GeminiRetryDelay = (milliseconds) =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function retryDelayMilliseconds(): number {
+  const jitter = new Uint16Array(1);
+  crypto.getRandomValues(jitter);
+  return 200 + (jitter[0] % 201);
+}
 
 export async function requestGeminiText(
   options: GeminiTextRequestOptions,
   fetchGemini: GeminiFetch = fetch,
   logDiagnostic: GeminiDiagnosticLogger = defaultLogger,
+  delay: GeminiRetryDelay = defaultRetryDelay,
 ): Promise<string> {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const outputBudget = attempt === 1
@@ -320,12 +333,17 @@ export async function requestGeminiText(
         finishReason: null,
         reasonCode: timedOut ? "timeout" : "network_failure",
       });
-      throw new GeminiProviderError(
+      const providerError = new GeminiProviderError(
         timedOut ? "timeout" : "network_failure",
         timedOut
           ? "The Gemini request timed out. Please try again."
           : "Could not reach Gemini. Please try again.",
       );
+      if (attempt === 1) {
+        await delay(retryDelayMilliseconds());
+        continue;
+      }
+      throw providerError;
     } finally {
       clearTimeout(timeoutId);
     }
@@ -342,6 +360,10 @@ export async function requestGeminiText(
         finishReason: null,
         reasonCode: providerError.code,
       });
+      if (providerError.code === "unavailable" && attempt === 1) {
+        await delay(retryDelayMilliseconds());
+        continue;
+      }
       throw providerError;
     }
 

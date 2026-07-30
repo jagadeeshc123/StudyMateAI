@@ -7,7 +7,8 @@ export interface PageChunk {
 }
 
 const MAX_REQUESTED_PAGES = 50;
-const PAGE_REFERENCE_PATTERN = /\bpages?\s+((?:(?:\d+)|(?:and|to)|[,&;–—-]|\s)+)/gi;
+const PAGE_REFERENCE_PATTERN =
+  /\bpages?\s+((?:(?:\d+)|(?:and|to)|[,&;–—-]|\s)+)/gi;
 const PAGE_TOKEN_PATTERN = /\d+|and|to|[-–—]/gi;
 const SEARCH_STOP_WORDS = new Set([
   "a",
@@ -15,10 +16,14 @@ const SEARCH_STOP_WORDS = new Set([
   "an",
   "and",
   "are",
+  "can",
   "describe",
+  "document",
+  "does",
   "explain",
   "for",
   "from",
+  "how",
   "in",
   "is",
   "me",
@@ -27,6 +32,7 @@ const SEARCH_STOP_WORDS = new Set([
   "page",
   "pages",
   "please",
+  "say",
   "summarize",
   "summary",
   "tell",
@@ -37,6 +43,23 @@ const SEARCH_STOP_WORDS = new Set([
   "what",
   "why",
 ]);
+
+function normalizeSearchToken(token: string): string {
+  const normalized = token.normalize("NFKC").toLocaleLowerCase();
+  if (normalized.length > 5 && normalized.endsWith("ing")) {
+    return normalized.slice(0, -3);
+  }
+  if (normalized.length > 4 && normalized.endsWith("ies")) {
+    return `${normalized.slice(0, -3)}y`;
+  }
+  if (
+    normalized.length > 3 && normalized.endsWith("s") &&
+    !normalized.endsWith("ss")
+  ) {
+    return normalized.slice(0, -1);
+  }
+  return normalized;
+}
 
 export class PageReferenceError extends Error {
   constructor(message: string) {
@@ -49,7 +72,9 @@ function addPage(pageNumbers: Set<number>, pageNumber: number): void {
   pageNumbers.add(pageNumber);
 
   if (pageNumbers.size > MAX_REQUESTED_PAGES) {
-    throw new PageReferenceError(`Request no more than ${MAX_REQUESTED_PAGES} pages at a time.`);
+    throw new PageReferenceError(
+      `Request no more than ${MAX_REQUESTED_PAGES} pages at a time.`,
+    );
   }
 }
 
@@ -94,9 +119,15 @@ export function extractSearchKeywords(question: string): string[] {
   const keywords = question
     .toLowerCase()
     .match(/[\p{L}\p{N}]+/gu)
-    ?.filter((word) => !/^\d+$/.test(word) && word.length > 1 && !SEARCH_STOP_WORDS.has(word)) ?? [];
+    ?.filter((word) =>
+      !/^\d+$/.test(word) && word.length > 1 && !SEARCH_STOP_WORDS.has(word)
+    ) ?? [];
 
-  return [...new Set(keywords)];
+  return [...new Set(keywords.map(normalizeSearchToken))];
+}
+
+export function normalizeKeywordQuery(question: string): string {
+  return extractSearchKeywords(question).join(" ");
 }
 
 export function rankChunksWithinPages(
@@ -112,26 +143,27 @@ export function rankChunksWithinPages(
 
   return chunks
     .map((chunk) => {
-      const normalizedContent = chunk.content.toLowerCase();
-      const score = keywords.reduce((total, keyword) => {
-        let occurrences = 0;
-        let position = normalizedContent.indexOf(keyword);
-
-        while (position >= 0) {
-          occurrences += 1;
-          position = normalizedContent.indexOf(keyword, position + keyword.length);
-        }
-
-        return total + occurrences;
-      }, 0);
+      const normalizedContent = (chunk.content.toLocaleLowerCase().match(
+        /[\p{L}\p{N}]+/gu,
+      ) ?? []).map(normalizeSearchToken);
+      const score = keywords.reduce(
+        (total, keyword) => {
+          return total +
+            normalizedContent.filter((token) => token === keyword).length;
+        },
+        keywords.length > 1 &&
+          normalizedContent.join(" ").includes(keywords.join(" "))
+          ? keywords.length * 2
+          : 0,
+      );
 
       return { chunk, score };
     })
     .filter(({ score }) => score > 0)
     .sort((first, second) =>
-      second.score - first.score
-      || first.chunk.page_number - second.chunk.page_number
-      || first.chunk.chunk_index - second.chunk.chunk_index
+      second.score - first.score ||
+      first.chunk.page_number - second.chunk.page_number ||
+      first.chunk.chunk_index - second.chunk.chunk_index
     )
     .slice(0, limit)
     .map(({ chunk, score }) => ({ ...chunk, rank: score }));

@@ -94,7 +94,11 @@ export type Database = {
           mime_type: string
           original_file_name: string
           page_count: number | null
+          processing_attempt_count: number
           processing_error: string | null
+          processing_heartbeat_at: string | null
+          processing_lease_id: string | null
+          processing_started_at: string | null
           processing_status: string
           storage_path: string
           user_id: string
@@ -107,7 +111,11 @@ export type Database = {
           mime_type?: string
           original_file_name: string
           page_count?: number | null
+          processing_attempt_count?: number
           processing_error?: string | null
+          processing_heartbeat_at?: string | null
+          processing_lease_id?: string | null
+          processing_started_at?: string | null
           processing_status?: string
           storage_path: string
           user_id: string
@@ -120,7 +128,11 @@ export type Database = {
           mime_type?: string
           original_file_name?: string
           page_count?: number | null
+          processing_attempt_count?: number
           processing_error?: string | null
+          processing_heartbeat_at?: string | null
+          processing_lease_id?: string | null
+          processing_started_at?: string | null
           processing_status?: string
           storage_path?: string
           user_id?: string
@@ -196,6 +208,7 @@ export type Database = {
           document_id: string | null
           id: string
           retrieval_mode: string
+          request_id: string | null
           role: string
           selected_document_count: number
         }
@@ -206,6 +219,7 @@ export type Database = {
           document_id?: string | null
           id?: string
           retrieval_mode?: string
+          request_id?: string | null
           role: string
           selected_document_count?: number
         }
@@ -216,6 +230,7 @@ export type Database = {
           document_id?: string | null
           id?: string
           retrieval_mode?: string
+          request_id?: string | null
           role?: string
           selected_document_count?: number
         }
@@ -264,6 +279,8 @@ export type Database = {
           original_file_name: string
           page_count: number | null
           processing_error: string | null
+          processing_attempt_count: number
+          processing_started_at: string | null
           processing_status: string
         }[]
       }
