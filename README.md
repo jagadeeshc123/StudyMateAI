@@ -223,3 +223,6 @@ The full audit additionally reports six dev-only High advisories in Vite/ESLint 
 - React Router, Vite, and ESLint major security upgrades remain controlled follow-ups as documented above.
 
 The reviewed staged-worker design is documented in `docs/large-pdf-worker-architecture.md`. The 20 MB limit remains unchanged because the current PDF library loads and extracts the complete PDF within one Edge Function request; batched inserts alone do not make that operation resumable.
+
+
+this project is still under developmental stage
